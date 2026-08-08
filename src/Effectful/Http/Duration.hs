@@ -13,11 +13,15 @@ module Effectful.Http.Duration (
   milliseconds,
   seconds,
   toMicroseconds,
+  fromNominalDiffTime,
+  toNominalDiffTime,
   scale,
   delay,
 ) where
 
+import Data.Fixed           (Pico)
 import Data.Int             (Int64)
+import Data.Time.Clock      (NominalDiffTime, nominalDiffTimeToSeconds, secondsToNominalDiffTime)
 import Effectful            (Eff, (:>))
 import Effectful.Concurrent (Concurrent, threadDelay)
 
@@ -54,6 +58,23 @@ times factor n
 
 toMicroseconds :: Duration -> Int64
 toMicroseconds (Microseconds n) = n
+
+{- | Meet the rest of the ecosystem, which measures time with @time@.
+Negative input clamps to zero and anything past 'Int64' microseconds clamps
+to the maximum, so this keeps the guarantee the smart constructors give.
+Sub-microsecond precision is truncated.
+-}
+fromNominalDiffTime :: NominalDiffTime -> Duration
+fromNominalDiffTime d
+  | micros <= 0 = mempty
+  | micros >= fromIntegral (maxBound @Int64) = Microseconds maxBound
+  | otherwise = Microseconds (truncate micros)
+ where
+  micros :: Pico
+  micros = nominalDiffTimeToSeconds d * 1_000_000
+
+toNominalDiffTime :: Duration -> NominalDiffTime
+toNominalDiffTime (Microseconds n) = secondsToNominalDiffTime (fromIntegral n / 1_000_000)
 
 scale :: Double -> Duration -> Duration
 scale factor (Microseconds n)

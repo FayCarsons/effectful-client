@@ -1,3 +1,4 @@
+{-# LANGUAGE DerivingVia #-}
 {- | An HTTP client as a dynamic effect with a single operation, so that every
 cross-cutting concern — retries, auth, base URLs, observation — is an ordinary
 @'Eff' es a -> 'Eff' es a@ built on 'Effectful.Dispatch.Dynamic.interpose'
@@ -32,8 +33,6 @@ module Effectful.Http (
   Exchange (..),
   Failure (..),
   fetch,
-  newHttpManager,
-  defaultHttpManager,
   runHttp,
 
   -- * URLs
@@ -47,6 +46,7 @@ module Effectful.Http (
   withPort,
   (/:),
   render,
+  validHost,
 
   -- * Requests
   Request (..),
@@ -82,11 +82,13 @@ module Effectful.Http (
   decodeOutcome,
 ) where
 
+import Control.Exception                     (throwIO)
 import Data.Aeson                            (FromJSON, ToJSON, eitherDecode', encode)
 import Data.ByteString                       (ByteString)
 import Data.ByteString.Builder               (Builder)
 import Data.ByteString.Lazy                  (fromStrict)
 import Data.ByteString.Lazy                  qualified as Lazy
+import Data.Char                             (isAsciiLower, isAsciiUpper, isDigit, isHexDigit)
 import Data.Coerce                           (coerce)
 import Data.Functor                          ((<&>))
 import Data.Int                              (Int64)
@@ -103,7 +105,6 @@ import GHC.Stack                             (HasCallStack)
 import Network.HTTP.Client                   hiding (Request, path, port)
 import Network.HTTP.Client                   qualified as Wire
 import Network.HTTP.Client.MultipartFormData (Part, formDataBody)
-import Network.HTTP.Client.TLS               (newTlsManager, newTlsManagerWith)
 import Network.HTTP.Types
 import Prelude                               hiding (head)
 
@@ -129,8 +130,9 @@ data Failure
     back: refused, reset, TLS rejected, timed out.
     -}
     Unreachable HttpExceptionContent
-  | {- | 'render' produced something @parseRequest@ rejects, so nothing was
-    ever sent. A malformed 'Host', in practice.
+  | {- | Nothing was ever sent, because the destination could not be named:
+    a 'Host' that 'validHost' rejects, or a redirect to a @Location@ that
+    http-client cannot parse.
     -}
     InvalidUrl Text
   deriving stock (Show)
@@ -175,6 +177,13 @@ data Url = Url
   }
   deriving stock (Show, Eq)
 
+{- | Extend the left URL's path with the right one's, keeping the left
+authority. This is @'/:'@ generalised to many segments, and the direction
+'Effectful.Http.Middleware.withBaseUrl' needs.
+-}
+instance Semigroup Url where
+  a <> b = a{path = a.path <> b.path}
+
 http :: Host -> Url
 http h = Url Http h Nothing []
 
@@ -196,16 +205,13 @@ render Url{scheme, host, port, path} =
   prefix Http  = "http://"
   prefix Https = "https://"
   renderPort (Port p) = ":" <> Text.pack (show p)
-  renderPath = foldMap segment
+
+renderPath :: [PathSegment] -> Text
+renderPath = foldMap segment
+ where
   segment (Segment raw) = "/" <> decodeUtf8 (urlEncode False (encodeUtf8 raw))
   segment (Encoded raw) = "/" <> raw
 
-{- | Extend the left URL's path with the right one's, keeping the left
-authority. This is @'/:'@ generalised to many segments, and the direction
-'Effectful.Http.Middleware.withBaseUrl' needs.
--}
-instance Semigroup Url where
-  a <> b = a{path = a.path <> b.path}
 
 -- * Requests
 
@@ -343,15 +349,6 @@ decodeOutcome = \case
 
 -- * Running
 
-{- | Allocate the connection pool once, at boot, and share the 'Manager'
-across every 'runHttp'. A manager per request defeats keep-alive.
--}
-newHttpManager :: (IOE :> es) => ManagerSettings -> Eff es Manager
-newHttpManager = newTlsManagerWith
-
-defaultHttpManager :: (IOE :> es) => Eff es Manager
-defaultHttpManager = newTlsManager
-
 runHttp :: (IOE :> es) => Manager -> Eff (Http : es) a -> Eff es a
 runHttp manager = interpret_ $ \(Fetch req) ->
   try @HttpException (liftIO $ buildRequest req >>= flip httpLbs manager) <&> \case
@@ -359,17 +356,55 @@ runHttp manager = interpret_ $ \(Fetch req) ->
     Left (HttpExceptionRequest _ content) -> Failed (Unreachable content)
     Left (InvalidUrlException _ reason)   -> Failed (InvalidUrl (Text.pack reason))
 
+{- | Assemble the wire request field by field. Nothing here round-trips
+through a URL string, so a 'Host' cannot be re-read as userinfo, a port, or
+the start of a path — the authority is whatever 'Url' says it is.
+-}
 buildRequest :: Request -> IO Wire.Request
-buildRequest req =
-  parseRequest (Text.unpack $ render req.url)
-    >>= applyBody req.body . \base ->
-      base
-        { Wire.method = req.method
-        , Wire.requestHeaders = req.headers
-        , Wire.queryString = renderQuery True req.query
-        , Wire.responseTimeout = wireTimeout req.timeout
-        , Wire.redirectCount = wireRedirects req.redirects
-        }
+buildRequest req
+  | not (validHost rawHost) = throwIO $ InvalidUrlException (Text.unpack url) "invalid host"
+  | otherwise =
+      applyBody req.body $
+        Wire.defaultRequest
+          { Wire.method = req.method
+          , Wire.secure = encrypted
+          , Wire.host = encodeUtf8 rawHost
+          , Wire.port = maybe implicitPort (\(Port p) -> fromIntegral p) req.url.port
+          , Wire.path = encodeUtf8 . nonEmptyPath $ renderPath req.url.path
+          , Wire.requestHeaders = req.headers
+          , Wire.queryString = renderQuery True req.query
+          , Wire.responseTimeout = wireTimeout req.timeout
+          , Wire.redirectCount = wireRedirects req.redirects
+          }
+ where
+  url = render req.url
+  rawHost = coerce req.url.host
+  encrypted = req.url.scheme == Https
+  implicitPort = if encrypted then 443 else 80
+  nonEmptyPath rendered
+    | Text.null rendered = "/"
+    | otherwise = rendered
+
+{- | Whether a 'Host' can stand as the authority on its own. A registered
+name may carry only unreserved characters, and an IPv6 literal must be
+bracketed. Everything else — @\@@, @\/@, @#@, @?@, whitespace, CR and LF —
+would change which server the request reaches or what the request line says,
+so it is rejected rather than escaped.
+
+Punycode an internationalised domain before it gets here; the Host header
+carries no encoding of its own.
+-}
+validHost :: Text -> Bool
+validHost raw = case Text.uncons raw of
+  Nothing          -> False
+  Just ('[', rest) -> bracketed rest
+  _                -> Text.all registered raw
+ where
+  bracketed rest = case Text.unsnoc rest of
+    Just (inner, ']') -> not (Text.null inner) && Text.all ipv6 inner
+    _                 -> False
+  ipv6 c = isHexDigit c || c == ':' || c == '.'
+  registered c = isAsciiLower c || isAsciiUpper c || isDigit c || c `elem` ("-._~" :: [Char])
 
 wireTimeout :: Timeout -> ResponseTimeout
 wireTimeout = \case

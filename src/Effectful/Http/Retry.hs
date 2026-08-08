@@ -1,17 +1,15 @@
-{-# LANGUAGE DerivingVia #-}
+{-# LANGUAGE NoOverloadedLists #-}
 {- | Retries as middleware over "Effectful.Http".
 
-A 'RetryPolicy' answers three separate questions, each independently
-replaceable:
+A 'RetryPolicy' has three elements
 
-* 'Classifier' — is this exchange worth another go? Pure, and composable
-  with @'<>'@, so a service's quirks stack onto 'transient' rather than
-  forking it.
-* 'Backoff' — should there be another attempt at all, and how long to wait?
+* 'Classifier': is this exchange worth another go? Composable
+  with @'<>'@
+* 'Backoff': should there be another attempt, and how long to wait.
   A 'Monoid': @'Nothing'@ means give up and absorbs, otherwise the longer
   delay wins. @'exponential' base '<>' 'limitRetries' 5@ therefore reads as
   the conjunction of two independent limits.
-* 'Jitter' — how to spread the herd, since synchronised clients retrying on
+* 'Jitter': how to spread the herd, since synchronised clients retrying on
   the same curve reconverge on the same instant.
 
 @
@@ -63,7 +61,6 @@ import Control.Monad              (guard)
 import Data.ByteString.Char8      qualified as Char8
 import Data.Char                  (isSpace)
 import Data.Functor               (($>))
-import Data.Set                   (Set)
 import Effectful
 import Effectful.Concurrent       (Concurrent)
 import Effectful.Dispatch.Dynamic (interpose_)
@@ -173,7 +170,7 @@ transient = Classifier $ \_ -> \case
       maybe Retry RetryAfter $ retryAfter response
     | otherwise -> Deliver
  where
-  congested :: Set Int
+  congested :: [Int]
   congested = [408, 425, 429, 500, 502, 503, 504]
 
   recoverable :: HttpExceptionContent -> Bool
@@ -202,13 +199,13 @@ idempotentOnly = Classifier $ \req exchange ->
   repeatable :: Method -> Bool
   repeatable m =
     m `elem`
-      ([ methodGet
-       , methodHead
-       , methodPut
-       , methodDelete
-       , methodOptions
-       , methodTrace
-       ] :: Set Method)
+      [ methodGet
+      , methodHead
+      , methodPut
+      , methodDelete
+      , methodOptions
+      , methodTrace
+      ]
 
   neverLanded :: Exchange -> Bool
   neverLanded = \case

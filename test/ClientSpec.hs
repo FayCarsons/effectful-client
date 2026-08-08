@@ -1,12 +1,14 @@
 module ClientSpec (spec) where
 
 import Control.Monad             (void)
+import Data.Foldable             (traverse_)
 import Data.List.NonEmpty        (NonEmpty (..))
 import Data.Maybe                (fromMaybe, listToMaybe)
+import Data.Text                 (Text)
 import Effectful
 import Effectful.Http
 import Effectful.Http.Middleware
-import Network.HTTP.Client       (HttpExceptionContent (ConnectionTimeout))
+import Network.HTTP.Client       (HttpExceptionContent (ConnectionTimeout), defaultManagerSettings, newManager)
 import Network.HTTP.Types        (methodGet, methodPost)
 import Prelude                   hiding (head)
 import Scripted                  (responded, runScripted, unreachable)
@@ -28,6 +30,40 @@ spec = do
     it "keeps the left authority when concatenated" $
       render ((https "api.example.com" /: "v1") <> (http "ignored" /: "users"))
         `shouldBe` "https://api.example.com/v1/users"
+
+  describe "validHost" $ do
+    it "accepts registered names and IPv6 literals" $
+      traverse_ (`shouldSatisfy` validHost)
+        (["example.com", "localhost", "a-b.c_d~e", "127.0.0.1", "[::1]", "[fe80::1]"] :: [Text])
+
+    {- Each of these was previously rendered into a URL string and handed back
+    to parseRequest, which read it as an authority again. The first sent the
+    request to attacker.com. -}
+    it "rejects anything that could be re-read as a different destination" $
+      traverse_ (`shouldNotSatisfy` validHost)
+        ( [ "evil.com@attacker.com"
+          , "example.com/../../etc"
+          , "example.com#fragment"
+          , "example.com?q=1"
+          , "example.com:8080"
+          , "example.com\r\nX-Injected: 1"
+          , "example com"
+          , ""
+          , "["
+          , "[]"
+          ]
+            :: [Text]
+        )
+
+  describe "a request that cannot name its destination" $
+    it "fails as a value, before any connection is attempted" $ do
+      manager <- newManager defaultManagerSettings
+      exchange <-
+        runEff . runHttp manager . fetch $
+          request methodGet (https "evil.com@attacker.com" /: "users")
+      exchange `shouldSatisfy` \case
+        Failed (InvalidUrl _) -> True
+        _                     -> False
 
   describe "the variadic builder" $ do
     it "collects headers and query parameters onto a request" $ do
