@@ -118,7 +118,8 @@ data Http :: Effect where
 
 type instance DispatchOf Http = Dynamic
 
--- | What came back — or did not.
+-- FIXME: This is an `Either`, redunant on that count *and* in that we should
+-- be using an effect for error handling
 data Exchange
   = Responded (Response Lazy.ByteString)
   | Failed Failure
@@ -353,8 +354,8 @@ runHttp :: (IOE :> es) => Manager -> Eff (Http : es) a -> Eff es a
 runHttp manager = interpret_ $ \(Fetch req) ->
   try @HttpException (liftIO $ buildRequest req >>= flip httpLbs manager) <&> \case
     Right response                        -> Responded response
-    Left (HttpExceptionRequest _ content) -> Failed (Unreachable content)
-    Left (InvalidUrlException _ reason)   -> Failed (InvalidUrl (Text.pack reason))
+    Left (HttpExceptionRequest _ content) -> Failed $ Unreachable content
+    Left (InvalidUrlException _ reason)   -> Failed $ InvalidUrl $ Text.pack reason
 
 {- | Assemble the wire request field by field. Nothing here round-trips
 through a URL string, so a 'Host' cannot be re-read as userinfo, a port, or
@@ -369,7 +370,7 @@ buildRequest req
           { Wire.method = req.method
           , Wire.secure = encrypted
           , Wire.host = encodeUtf8 rawHost
-          , Wire.port = maybe implicitPort (\(Port p) -> fromIntegral p) req.url.port
+          , Wire.port = maybe implicitPort (fromIntegral @Word16 . coerce) req.url.port
           , Wire.path = encodeUtf8 . nonEmptyPath $ renderPath req.url.path
           , Wire.requestHeaders = req.headers
           , Wire.queryString = renderQuery True req.query
@@ -382,6 +383,8 @@ buildRequest req
   encrypted = req.url.scheme == Https
   implicitPort = if encrypted then 443 else 80
   nonEmptyPath rendered
+    -- NOTE: Is this branch reachable? I feel that we should enforce
+    -- non-emptiness before this point. Coercing to "/" also seems wrong
     | Text.null rendered = "/"
     | otherwise = rendered
 

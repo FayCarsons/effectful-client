@@ -68,19 +68,19 @@ fromNominalDiffTime :: NominalDiffTime -> Duration
 fromNominalDiffTime d
   | micros <= 0 = mempty
   | micros >= fromIntegral (maxBound @Int64) = Microseconds maxBound
-  | otherwise = Microseconds (truncate micros)
+  | otherwise = Microseconds $ truncate micros
  where
   micros :: Pico
   micros = nominalDiffTimeToSeconds d * 1_000_000
 
 toNominalDiffTime :: Duration -> NominalDiffTime
-toNominalDiffTime (Microseconds n) = secondsToNominalDiffTime (fromIntegral n / 1_000_000)
+toNominalDiffTime (Microseconds n) = secondsToNominalDiffTime $ fromIntegral n / 1_000_000
 
 scale :: Double -> Duration -> Duration
 scale factor (Microseconds n)
   | factor <= 0 = mempty
   | scaled >= fromIntegral (maxBound @Int64) = Microseconds maxBound
-  | otherwise = Microseconds (round scaled)
+  | otherwise = Microseconds $ round scaled
  where
   scaled = factor * fromIntegral n
 

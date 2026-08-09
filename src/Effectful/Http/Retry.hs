@@ -125,9 +125,8 @@ data Verdict
   = -- | This exchange is the answer; another attempt cannot improve it.
     Deliver
   | Retry
-  | {- | The server named a delay, via @Retry-After@. Overrides the backoff's
-    for this attempt, but not 'maximumDelay'.
-    -}
+  | -- | The server named a delay, via @Retry-After@. Overrides the backoff's
+    -- for this attempt, but not 'maximumDelay'.
     RetryAfter Duration
   deriving stock (Show, Eq)
 
@@ -217,7 +216,7 @@ idempotentOnly = Classifier $ \req exchange ->
 -- | @'whenStatus' ((429 ==) . 'statusCode') ('RetryAfter' ('seconds' 60))@
 whenStatus :: (Status -> Bool) -> Verdict -> Classifier
 whenStatus matches verdict = Classifier $ \_ -> \case
-  Responded response | matches (responseStatus response) -> verdict
+  Responded response | matches $ responseStatus response -> verdict
   _                                                      -> Deliver
 
 {- | The delay a server asked for. Only RFC 7231's delta-seconds form; the
@@ -266,7 +265,10 @@ exponential base = Backoff $ \attempt ->
 
 -- | @base@, @base@, @2 * base@, @3 * base@, @5 * base@, … — a gentler climb.
 fibonacci :: Duration -> Backoff
-fibonacci base = Backoff $ \attempt -> Just . flip scale base $ nth attempt.number
+fibonacci base = Backoff $ \attempt ->
+  Just
+    . flip scale base
+    $ nth attempt.number
  where
   nth n
     | n <= 1 = 1
@@ -277,11 +279,13 @@ fibonacci base = Backoff $ \attempt -> Just . flip scale base $ nth attempt.numb
 
 -- | At most @n@ retries, so at most @n + 1@ sends.
 limitRetries :: Int -> Backoff
-limitRetries limit = Backoff $ \attempt -> guard (attempt.number <= limit) $> mempty
+limitRetries limit = Backoff $ \attempt ->
+  guard (attempt.number <= limit) $> mempty
 
 -- | Stop once this much has been spent sleeping, however many retries that took.
 limitTotalDelay :: Duration -> Backoff
-limitTotalDelay budget = Backoff $ \attempt -> guard (attempt.waited < budget) $> mempty
+limitTotalDelay budget = Backoff $ \attempt ->
+  guard (attempt.waited < budget) $> mempty
 
 giveUp :: Backoff
 giveUp = Backoff $ const Nothing

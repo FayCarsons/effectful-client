@@ -23,6 +23,8 @@ above, is re-applied on every attempt — which is what a signature over a
 timestamp, or a token that may have been refreshed, requires. Auth placed
 before it is computed once and replayed verbatim.
 -}
+-- FIXME: We should, at the very least, define our own lenses if not pull in
+-- the `optics` library in order to make the functions in this module more readable
 module Effectful.Http.Middleware (
   -- * Composing
   Middleware (..),
