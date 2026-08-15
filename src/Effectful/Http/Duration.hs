@@ -20,9 +20,10 @@ module Effectful.Http.Duration (
 ) where
 
 import Data.Fixed           (Pico)
+import Data.Function
 import Data.Int             (Int64)
 import Data.Time.Clock      (NominalDiffTime, nominalDiffTimeToSeconds, secondsToNominalDiffTime)
-import Effectful            (Eff, (:>))
+import Effectful
 import Effectful.Concurrent (Concurrent, threadDelay)
 
 newtype Duration = Microseconds Int64
@@ -85,4 +86,9 @@ scale factor (Microseconds n)
   scaled = factor * fromIntegral n
 
 delay :: (Concurrent :> es) => Duration -> Eff es ()
-delay (Microseconds n) = threadDelay . fromIntegral $ min n (fromIntegral (maxBound @Int))
+delay (Microseconds n) =
+  maxBound @Int
+    & fromIntegral
+    & min n
+    & fromIntegral
+    & threadDelay

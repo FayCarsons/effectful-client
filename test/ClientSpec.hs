@@ -1,17 +1,19 @@
 module ClientSpec (spec) where
 
 import Control.Monad             (void)
+import Data.ByteString.Lazy      qualified as Lazy
 import Data.Foldable             (traverse_)
 import Data.List.NonEmpty        (NonEmpty (..))
 import Data.Maybe                (fromMaybe, listToMaybe)
 import Data.Text                 (Text)
 import Effectful
+import Effectful.Error.Static    (Error, runErrorNoCallStack)
 import Effectful.Http
 import Effectful.Http.Middleware
-import Network.HTTP.Client       (HttpExceptionContent (ConnectionTimeout), defaultManagerSettings, newManager)
+import Network.HTTP.Client       (Response, defaultManagerSettings, newManager)
 import Network.HTTP.Types        (methodGet, methodPost)
 import Prelude                   hiding (head)
-import Scripted                  (responded, runScripted, unreachable)
+import Scripted                  (rawResponse, responded, runScripted)
 import Test.Hspec
 
 spec :: Spec
@@ -30,6 +32,10 @@ spec = do
     it "keeps the left authority when concatenated" $
       render ((https "api.example.com" /: "v1") <> (http "ignored" /: "users"))
         `shouldBe` "https://api.example.com/v1/users"
+
+    it "renders its query string" $
+      render (https "example.com" /: "users" /? [("page", Just "2")])
+        `shouldBe` "https://example.com/users?page=2"
 
   describe "validHost" $ do
     it "accepts registered names and IPv6 literals" $
@@ -58,12 +64,12 @@ spec = do
   describe "a request that cannot name its destination" $
     it "fails as a value, before any connection is attempted" $ do
       manager <- newManager defaultManagerSettings
-      exchange <-
-        runEff . runHttp manager . fetch $
+      outcome <-
+        runEff . runErrorNoCallStack @HttpError . runHttp manager . fetch @Lazy.ByteString $
           request methodGet (https "evil.com@attacker.com" /: "users")
-      exchange `shouldSatisfy` \case
-        Failed (InvalidUrl _) -> True
-        _                     -> False
+      outcome `shouldSatisfy` \case
+        Left (InvalidUrl _) -> True
+        _                   -> False
 
   describe "the variadic builder" $ do
     it "collects headers and query parameters onto a request" $ do
@@ -71,7 +77,19 @@ spec = do
           built = get (https "example.com") (header "Accept" "application/json") (param "page" "2")
       built.method `shouldBe` methodGet
       built.headers `shouldBe` [("Accept", "application/json")]
-      built.query `shouldBe` [("page", Just "2")]
+      built.url.query `shouldBe` [("page", Just "2")]
+
+    it "keeps headers and query parameters in call-site order" $ do
+      let built :: Request
+          built =
+            get
+              (https "example.com" /: "u")
+              (header "A" "1")
+              (header "B" "2")
+              (param "p" "1")
+              (param "q" "2")
+      built.headers `shouldBe` [("A", "1"), ("B", "2")]
+      built.url.query `shouldBe` [("p", Just "1"), ("q", Just "2")]
 
     it "gives each verb its method" $ do
       (post url' :: Request).method `shouldBe` methodPost
@@ -86,24 +104,42 @@ spec = do
     it "treats a reopened file as replayable" $
       replay (FromFile "/etc/hosts") `shouldBe` Replayable
 
-  describe "decodeOutcome" $ do
-    it "decodes a 2xx body" $
-      decodeOutcome @[Int] (responded 200 [] "[1,2,3]") `shouldSatisfy` \case
-        Succeeded xs -> xs == [1, 2, 3]
+  describe "ResponseBody" $ do
+    it "reads the bytes verbatim, whatever the status" $
+      readBody @Lazy.ByteString (rawResponse 404 [] "gone") `shouldSatisfy` \case
+        Right "gone" -> True
         _            -> False
 
-    it "separates a body it cannot read from one the server refused" $ do
-      decodeOutcome @[Int] (responded 200 [] "not json") `shouldSatisfy` \case
-        Undecodable{} -> True
+    it "reads a well-formed body as Text" $
+      readBody @Text (rawResponse 200 [] "hello") `shouldSatisfy` \case
+        Right "hello" -> True
         _             -> False
-      decodeOutcome @[Int] (responded 404 [] "gone") `shouldSatisfy` \case
-        Rejected{} -> True
-        _          -> False
 
-    it "reports a request that never got an answer" $
-      decodeOutcome @[Int] (unreachable ConnectionTimeout) `shouldSatisfy` \case
-        Unanswered (Unreachable ConnectionTimeout) -> True
-        _                                          -> False
+    it "reports invalid UTF-8 as Unreadable, whatever the status" $
+      readBody @Text (rawResponse 500 [] "\xff") `shouldSatisfy` \case
+        Left (Unreadable _ _) -> True
+        _                     -> False
+
+    it "discards the body for ()" $
+      readBody @() (rawResponse 500 [] "whatever") `shouldSatisfy` \case
+        Right () -> True
+        _        -> False
+
+    describe "Json" $ do
+      it "decodes a 2xx body" $
+        readBody @(Json [Int]) (rawResponse 200 [] "[1,2,3]") `shouldSatisfy` \case
+          Right (Json [1, 2, 3]) -> True
+          _                      -> False
+
+      it "reports a decode failure as Unreadable" $
+        readBody @(Json [Int]) (rawResponse 200 [] "not json") `shouldSatisfy` \case
+          Left (Unreadable _ _) -> True
+          _                     -> False
+
+      it "refuses a non-2xx response outright, without trying to decode" $
+        readBody @(Json [Int]) (rawResponse 404 [] "gone") `shouldSatisfy` \case
+          Left (Rejected _) -> True
+          _                 -> False
 
   describe "middleware" $ do
     it "applies the first of a stack closest to the program" $ do
@@ -139,13 +175,17 @@ url' = https "example.com"
 asks for @\/users@ and names its own @Accept@, so both the overriding and the
 deferring header middleware have something to act on.
 -}
-sent :: Middleware '[Http, IOE] -> IO Request
-sent stack =
-  fmap (fromMaybe (error "no request was made") . listToMaybe . snd)
-    . runEff
-    . runScripted (responded 200 [] "{}" :| [])
-    . apply stack
-    $ void asking
+sent :: Middleware '[Http, Error HttpError, IOE] -> IO Request
+sent stack = do
+  outcome <-
+    runEff
+      . runErrorNoCallStack @HttpError
+      . runScripted (responded 200 [] "{}" :| [])
+      . apply stack
+      $ void asking
+  case outcome of
+    Right (_, requests) -> pure . fromMaybe (error "no request was made") $ listToMaybe requests
+    Left err             -> error $ "unexpected HttpError: " <> show err
  where
-  asking :: Eff '[Http, IOE] Exchange
+  asking :: Eff '[Http, Error HttpError, IOE] (Response Lazy.ByteString)
   asking = get (url' /: "users") (header "Accept" "application/json")

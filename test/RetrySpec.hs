@@ -1,22 +1,25 @@
 module RetrySpec (spec) where
 
 import Control.Monad           (void)
+import Data.Bifunctor          (first)
 import Data.ByteString         (ByteString)
+import Data.ByteString.Lazy    qualified as Lazy
 import Data.List.NonEmpty      (NonEmpty (..))
 import Data.Maybe              (isJust)
 import Data.Text               (Text)
 import Data.Text               qualified as Text
 import Effectful
 import Effectful.Concurrent    (runConcurrent)
-import Effectful.Http          (Body (NoBody, Streamed), Exchange (..), Request (..), fetch, https, request)
+import Effectful.Error.Static  (runErrorNoCallStack, tryError)
+import Effectful.Http          (Attempted (..), HttpError, Request (..), RequestBody (NoBody, Streamed), fetch, https, request)
 import Effectful.Http.Duration (Duration, milliseconds, seconds)
 import Effectful.Http.Retry
 import Hedgehog                (Gen, PropertyT, forAll, forAllWith, (===))
 import Hedgehog.Gen            qualified as Gen
 import Hedgehog.Range          qualified as Range
-import Network.HTTP.Client     (HttpExceptionContent (..))
+import Network.HTTP.Client     (HttpExceptionContent (..), responseHeaders, responseStatus)
 import Network.HTTP.Types      (hRetryAfter, methodGet, methodPost, statusCode)
-import Scripted                (responded, runScripted, unreachable)
+import Scripted                (Exchange (..), responded, runScripted, unreachable)
 import System.Timeout          (timeout)
 import Test.Hspec
 import Test.Hspec.Hedgehog     (hedgehog)
@@ -61,24 +64,24 @@ spec = do
 
   describe "transient" $ do
     it "reads the delay a server asks for" $
-      classify transient (get' NoBody) (busyUntil "3") `shouldBe` RetryAfter (seconds 3)
+      classify transient (get' NoBody) (asAttempted $ busyUntil "3") `shouldBe` RetryAfter (seconds 3)
 
     it "falls back to the backoff when Retry-After is a date" $
-      classify transient (get' NoBody) (busyUntil "Wed, 21 Oct 2015 07:28:00 GMT")
+      classify transient (get' NoBody) (asAttempted $ busyUntil "Wed, 21 Oct 2015 07:28:00 GMT")
         `shouldBe` Retry
 
     it "delivers a response the server meant" $
-      classify transient (get' NoBody) ok `shouldBe` Deliver
+      classify transient (get' NoBody) (asAttempted ok) `shouldBe` Deliver
 
     it "delivers a 404, which no retry can fix" $
-      classify transient (get' NoBody) (responded 404 [] "") `shouldBe` Deliver
+      classify transient (get' NoBody) (asAttempted $ responded 404 [] "") `shouldBe` Deliver
 
   describe "Classifier composition" $
     it "lets a specific rule shadow the general one" $ do
       let policy = whenStatus ((409 ==) . statusCode) Retry <> transient
-      classify policy (get' NoBody) (responded 409 [] "") `shouldBe` Retry
-      classify policy (get' NoBody) (responded 503 [] "") `shouldBe` Retry
-      classify policy (get' NoBody) (responded 404 [] "") `shouldBe` Deliver
+      classify policy (get' NoBody) (asAttempted $ responded 409 [] "") `shouldBe` Retry
+      classify policy (get' NoBody) (asAttempted $ responded 503 [] "") `shouldBe` Retry
+      classify policy (get' NoBody) (asAttempted $ responded 404 [] "") `shouldBe` Deliver
 
   describe "retryAfter" $ do
     it "reads delta-seconds" $
@@ -144,14 +147,19 @@ spec = do
 
 {- | How many requests reached the wire, after @policy@ had its say. Delays
 are pinned to zero so the suite stays fast.
+
+'HttpError' is caught locally, inside the scripted 'Http' scope, so a final
+give-up that re-throws does not cost the caller the count of requests
+already made.
 -}
 sends :: RetryPolicy -> Request -> NonEmpty Exchange -> IO Int
 sends policy req script =
-  fmap (length . snd)
+  fmap (either (const 0) (length . snd))
     . runEff
+    . runErrorNoCallStack @HttpError
     . runConcurrent
     . runScripted script
-    $ withRetry policy (void (fetch req))
+    $ void . fmap (first snd) . tryError @HttpError $ withRetry policy (fetch @Lazy.ByteString req)
 
 -- | 'Nothing' if the action slept when it should not have.
 finishes :: IO a -> IO (Maybe a)
@@ -168,13 +176,13 @@ immediate classifier retries =
 
 -- * Fixtures
 
-get' :: Body -> Request
+get' :: RequestBody -> Request
 get' body = (request methodGet (https "example.com")){body}
 
-post' :: Body -> Request
+post' :: RequestBody -> Request
 post' body = (request methodPost (https "example.com")){body}
 
-streaming :: Body
+streaming :: RequestBody
 streaming = Streamed 0 ($ pure "")
 
 ok, busy, timedOut, refused :: Exchange
@@ -186,10 +194,16 @@ refused = unreachable ConnectionTimeout
 busyUntil :: ByteString -> Exchange
 busyUntil after = responded 503 [(hRetryAfter, after)] ""
 
+-- | What a 'Classifier' or 'retryAfter' sees, collapsed from a scripted answer.
+asAttempted :: Exchange -> Attempted
+asAttempted = \case
+  Responded response -> Answered (responseStatus response) (responseHeaders response)
+  Failed content      -> NoAnswer content
+
 retryAfterOf :: ByteString -> Maybe Duration
 retryAfterOf after = case busyUntil after of
-  Responded response -> retryAfter response
-  _                  -> Nothing
+  Responded response -> retryAfter (responseHeaders response)
+  Failed _            -> Nothing
 
 -- * Generators
 

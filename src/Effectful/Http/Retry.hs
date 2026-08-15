@@ -64,9 +64,10 @@ import Data.Functor               (($>))
 import Effectful
 import Effectful.Concurrent       (Concurrent)
 import Effectful.Dispatch.Dynamic (interpose_)
-import Effectful.Http             (Exchange (..), Failure (..), Http (..), Replay (Replayable), Request (..), fetch, replay)
+import Effectful.Error.Static     (Error, throwError)
+import Effectful.Http             (Attempted (..), Http (..), HttpError, Replay (Replayable), Request (..), attempted, fetch, replay, tried)
 import Effectful.Http.Duration    (Duration, delay, milliseconds, scale, seconds)
-import Network.HTTP.Client        (HttpExceptionContent (..), Response, responseHeaders, responseStatus)
+import Network.HTTP.Client        (HttpExceptionContent (..))
 import Network.HTTP.Types
 import System.Random.Stateful     (globalStdGen, uniformRM)
 
@@ -97,28 +98,45 @@ defaultRetryPolicy =
 {- | 'IOE' is here only for the jitter's entropy — effectful offers no
 randomness effect, and any program that reaches the wire has 'IOE' anyway.
 -}
-withRetry :: (Concurrent :> es, Http :> es, IOE :> es) => RetryPolicy -> Eff es a -> Eff es a
-withRetry policy = interpose_ $ \(Fetch req) -> attempt req (Attempt 1 mempty)
+withRetry ::
+  forall es a.
+  (Concurrent :> es, Http :> es, Error HttpError :> es, IOE :> es) =>
+  RetryPolicy ->
+  Eff es a ->
+  Eff es a
+withRetry policy = interpose_ handle
  where
   Backoff schedule = policy.backoff
 
-  attempt req counter =
-    fetch req >>= \exchange -> case planned req exchange counter of
-      Nothing -> pure exchange
-      Just wait -> do
-        slept <- jittered policy.jitter wait
-        delay slept
-        attempt req Attempt{number = counter.number + 1, waited = counter.waited <> slept}
+  {- | Explicit and nested, rather than a sibling in this @where@ clause: the
+  refinement 'Fetch' brings — that its result is some @'Response' bodyType@
+  with a 'ResponseBody' instance — only holds inside the scope that pattern
+  match opens, and a helper defined alongside 'handle' rather than beneath
+  it cannot see that scope.
+  -}
+  handle :: forall localEs answer. Http (Eff localEs) answer -> Eff es answer
+  handle (Fetch req) = attempt req (Attempt 1 mempty)
+   where
+    attempt :: Request -> Attempt -> Eff es answer
+    attempt req' counter = do
+      outcome <- tried $ fetch req'
+      case planned req' (attempted outcome) counter of
+        Nothing -> either throwError pure outcome
+        Just wait -> do
+          slept <- jittered policy.jitter wait
+          delay slept
+          attempt req' Attempt{number = counter.number + 1, waited = counter.waited <> slept}
 
-  planned req exchange counter = do
-    guard $ replay req.body == Replayable
-    verdict <- case classify policy.classifier req exchange of
-      Deliver -> Nothing
-      other   -> Just other
-    scheduled <- schedule counter
-    pure . min policy.maximumDelay $ case verdict of
-      RetryAfter dictated -> dictated
-      _                   -> scheduled
+    planned :: Request -> Attempted -> Attempt -> Maybe Duration
+    planned req' seen counter = do
+      guard $ replay req'.body == Replayable
+      verdict <- case classify policy.classifier req' seen of
+        Deliver -> Nothing
+        other   -> Just other
+      scheduled <- schedule counter
+      pure . min policy.maximumDelay $ case verdict of
+        RetryAfter dictated -> dictated
+        _                   -> scheduled
 
 -- * Deciding whether
 data Verdict
@@ -134,17 +152,17 @@ data Verdict
 'Deliver', so a specific rule shadows a general one: @'whenStatus' … '<>'
 'transient'@.
 -}
-newtype Classifier = Classifier (Request -> Exchange -> Verdict)
+newtype Classifier = Classifier (Request -> Attempted -> Verdict)
 
 instance Semigroup Classifier where
-  Classifier a <> Classifier b = Classifier $ \req exchange -> case a req exchange of
-    Deliver -> b req exchange
+  Classifier a <> Classifier b = Classifier $ \req attempt -> case a req attempt of
+    Deliver -> b req attempt
     verdict -> verdict
 
 instance Monoid Classifier where
   mempty = never
 
-classify :: Classifier -> Request -> Exchange -> Verdict
+classify :: Classifier -> Request -> Attempted -> Verdict
 classify (Classifier decide) = decide
 
 never :: Classifier
@@ -160,13 +178,12 @@ safe to repeat.
 -}
 transient :: Classifier
 transient = Classifier $ \_ -> \case
-  Failed (InvalidUrl _) -> Deliver
-  Failed (Unreachable content)
+  Unsent _ -> Deliver
+  NoAnswer content
     | recoverable content -> Retry
     | otherwise -> Deliver
-  Responded response
-    | statusCode (responseStatus response) `elem` congested ->
-      maybe Retry RetryAfter $ retryAfter response
+  Answered status headers
+    | statusCode status `elem` congested -> maybe Retry RetryAfter $ retryAfter headers
     | otherwise -> Deliver
  where
   congested :: [Int]
@@ -190,9 +207,9 @@ the server. A 'ResponseTimeout' in particular is /not/ retried for those: the
 server may have processed the request and merely been slow to answer.
 -}
 idempotentOnly :: Classifier
-idempotentOnly = Classifier $ \req exchange ->
-  if repeatable req.method || neverLanded exchange
-    then classify transient req exchange
+idempotentOnly = Classifier $ \req attempt ->
+  if repeatable req.method || neverLanded attempt
+    then classify transient req attempt
     else Deliver
  where
   repeatable :: Method -> Bool
@@ -206,26 +223,26 @@ idempotentOnly = Classifier $ \req exchange ->
       , methodTrace
       ]
 
-  neverLanded :: Exchange -> Bool
+  neverLanded :: Attempted -> Bool
   neverLanded = \case
-    Failed (Unreachable ConnectionTimeout)       -> True
-    Failed (Unreachable ConnectionFailure{})     -> True
-    Failed (Unreachable ProxyConnectException{}) -> True
-    _                                            -> False
+    NoAnswer ConnectionTimeout       -> True
+    NoAnswer ConnectionFailure{}     -> True
+    NoAnswer ProxyConnectException{} -> True
+    _                                -> False
 
 -- | @'whenStatus' ((429 ==) . 'statusCode') ('RetryAfter' ('seconds' 60))@
 whenStatus :: (Status -> Bool) -> Verdict -> Classifier
 whenStatus matches verdict = Classifier $ \_ -> \case
-  Responded response | matches $ responseStatus response -> verdict
-  _                                                      -> Deliver
+  Answered status _ | matches status -> verdict
+  _                                  -> Deliver
 
 {- | The delay a server asked for. Only RFC 7231's delta-seconds form; the
 HTTP-date form cannot be resolved without reading a clock, and callers fall
 back to the backoff's own schedule when this is 'Nothing'.
 -}
-retryAfter :: Response body -> Maybe Duration
-retryAfter response = do
-  raw <- lookup hRetryAfter (responseHeaders response)
+retryAfter :: [Header] -> Maybe Duration
+retryAfter headers = do
+  raw <- lookup hRetryAfter headers
   (count, rest) <- Char8.readInt (Char8.dropWhile isSpace raw)
   guard . Char8.all isSpace $ rest
   pure . seconds . fromIntegral $ count

@@ -6,32 +6,42 @@ rather than another field on the interpreter. See
 "Effectful.Http.Retry" and "Effectful.Http.Middleware" for the
 canonical ones.
 
-Transport failures are values, not exceptions: 'runHttp' catches
-'HttpException' at the wire and hands back a 'Failed' 'Exchange'. Middleware
-therefore pattern matches on what went wrong instead of wrapping itself in
-@catch@, which is what makes a retry loop readable. Non-2xx responses are not
-failures at all — @checkResponse@ is left at http-client's default, so the
-server's answer arrives as 'Responded' whatever its status, and deciding what
-a status /means/ is the caller's or a middleware's job.
+Failure is 'Effectful.Error.Static.Error', not a value threaded through the
+return type: 'runHttp' throws 'HttpError' at the wire, and a middleware
+built with 'Effectful.Error.Static.tryError' pattern matches on what went
+wrong instead of wrapping itself in @catch@, which is what makes a retry
+loop readable.
 
-Requests are built variadically. 'collect' accumulates any number of
-'Applies' arguments and stops at whatever the call site asks for:
+The response type is chosen at the call site, through 'ResponseBody': asking
+for 'Data.ByteString.Lazy.ByteString' reads the wire verbatim, whatever the
+status, while asking for a 'Json' value refuses a non-2xx response outright.
+The status policy therefore lives with the reading, not with the effect.
 
 @
+data User = User {name :: 'Data.Text.Text'}
+  deriving stock (Generic)
+  deriving anyclass (FromJSON)
+  deriving ResponseBody via (Json User)
+
 'get' ('https' "api.example.com" '/:' "v1" '/:' "users")
   ('header' "Accept" "application/json")
   ('param' "page" "2")
-  :: 'Eff' es ('Outcome' [User])
+  :: 'Eff' es ('Network.HTTP.Client.Response' ('Json' [User]))
 @
 
-Ask for @'Eff' es 'Exchange'@ to see the raw response, or for @'Request'@ to
-build one without sending it.
+Ask for @'Eff' es ('Network.HTTP.Client.Response' 'Data.ByteString.Lazy.ByteString')@ to see the raw
+response, or for @'Request'@ to build one without sending it.
+
+Requests are built variadically. 'collect' accumulates any number of
+'Applies' arguments and stops at whatever the call site asks for.
 -}
 module Effectful.Http (
   -- * The effect
   Http (..),
-  Exchange (..),
-  Failure (..),
+  HttpError (..),
+  Attempted (..),
+  attempted,
+  tried,
   fetch,
   runHttp,
 
@@ -45,6 +55,7 @@ module Effectful.Http (
   https,
   withPort,
   (/:),
+  (/?),
   render,
   validHost,
 
@@ -58,7 +69,7 @@ module Effectful.Http (
   param,
 
   -- * Request bodies
-  Body (..),
+  RequestBody (..),
   Replay (..),
   replay,
   jsonBody,
@@ -77,32 +88,34 @@ module Effectful.Http (
   HttpArgs (..),
   Applies (..),
 
-  -- * Decoding a response
-  Outcome (..),
-  decodeOutcome,
+  -- * Reading a response
+  ResponseBody (..),
+  Json (..),
+  onlySuccess,
 ) where
 
 import Control.Exception                     (throwIO)
 import Data.Aeson                            (FromJSON, ToJSON, eitherDecode', encode)
+import Data.Bifunctor                        (first)
 import Data.ByteString                       (ByteString)
 import Data.ByteString.Builder               (Builder)
 import Data.ByteString.Lazy                  (fromStrict)
 import Data.ByteString.Lazy                  qualified as Lazy
 import Data.Char                             (isAsciiLower, isAsciiUpper, isDigit, isHexDigit)
 import Data.Coerce                           (coerce)
-import Data.Functor                          ((<&>))
 import Data.Int                              (Int64)
 import Data.String                           (IsString (..))
 import Data.Text                             (Text)
 import Data.Text                             qualified as Text
-import Data.Text.Encoding                    (decodeUtf8, encodeUtf8)
+import Data.Text.Encoding                    (decodeUtf8, decodeUtf8', encodeUtf8)
 import Data.Word                             (Word16)
 import Effectful
 import Effectful.Dispatch.Dynamic            (interpret_, send)
+import Effectful.Error.Static                (Error, throwError, tryError)
 import Effectful.Exception                   (try)
 import Effectful.Http.Duration               (Duration, toMicroseconds)
 import GHC.Stack                             (HasCallStack)
-import Network.HTTP.Client                   hiding (Request, path, port)
+import Network.HTTP.Client                   hiding (Request, RequestBody, path, port)
 import Network.HTTP.Client                   qualified as Wire
 import Network.HTTP.Client.MultipartFormData (Part, formDataBody)
 import Network.HTTP.Types
@@ -114,19 +127,12 @@ import Prelude                               hiding (head)
 build the 'Request' or a way to intercept the operation.
 -}
 data Http :: Effect where
-  Fetch :: Request -> Http m Exchange
+  Fetch :: (ResponseBody a) => Request -> Http m (Response a)
 
 type instance DispatchOf Http = Dynamic
 
--- FIXME: This is an `Either`, redunant on that count *and* in that we should
--- be using an effect for error handling
-data Exchange
-  = Responded (Response Lazy.ByteString)
-  | Failed Failure
-  deriving stock (Show)
-
--- | Why no response arrived. Never a status code: a 503 is a 'Responded'.
-data Failure
+-- | Why a 'fetch' did not deliver what was asked for.
+data HttpError
   = {- | The request reached the network stack and no usable response came
     back: refused, reset, TLS rejected, timed out.
     -}
@@ -136,10 +142,57 @@ data Failure
     http-client cannot parse.
     -}
     InvalidUrl Text
+  | -- | The server answered outside 2xx, and the reading in question declines that.
+    Rejected (Response Lazy.ByteString)
+  | -- | The server answered, and the bytes were not what the reading expected.
+    Unreadable (Response Lazy.ByteString) Text
   deriving stock (Show)
 
-fetch :: (HasCallStack, Http :> es) => Request -> Eff es Exchange
+{- | Sending is all this asks for. Throwing 'HttpError' is an obligation of
+the interpretation, not of the operation — 'runHttp' takes it on, and an
+interpreter that answers from a script need not — so the constraint belongs
+on 'runHttp' and on the middleware that catches, and not here.
+
+The @forall@ is ordered so that @'fetch' \@Value@ picks the reading rather
+than the effect row.
+-}
+fetch :: forall a es. (HasCallStack, Http :> es, ResponseBody a) => Request -> Eff es (Response a)
 fetch = send . Fetch
+
+{- | What a single attempt came to, for a retry 'Effectful.Http.Retry.Classifier'
+or 'Effectful.Http.Middleware.withObserver' to see. 'Answered' carries only
+the status and headers — never the body — so it states in the type that
+neither may look at what the server sent back: a 503 reaches a classifier
+identically whether the call site asked for raw bytes (arriving as a
+success) or for JSON (arriving as a thrown 'Rejected').
+-}
+data Attempted
+  = -- | Never left the process; no retry can help. 'InvalidUrl''s reason.
+    Unsent Text
+  | -- | Went out, nothing usable came back. 'Unreachable''s content.
+    NoAnswer HttpExceptionContent
+  | Answered Status [Header]
+  deriving stock (Show)
+
+{- | Run a 'fetch' and hand back how it went instead of unwinding, for the
+middleware that has to look before it decides. The call stack
+'Effectful.Error.Static.tryError' pairs with the error is dropped: a
+'Classifier' has no use for it, and 'throwError' would attach a fresh one on
+the way back out anyway.
+-}
+tried :: (Error HttpError :> es) => Eff es a -> Eff es (Either HttpError a)
+tried = fmap (first snd) . tryError
+
+-- | Collapse a read 'fetch' down to what a retry or an observer may see.
+attempted :: Either HttpError (Response a) -> Attempted
+attempted = \case
+  Left (Unreachable content)   -> NoAnswer content
+  Left (InvalidUrl reason)     -> Unsent reason
+  Left (Rejected response)     -> answered response
+  Left (Unreadable response _) -> answered response
+  Right response                -> answered response
+ where
+  answered response = Answered (responseStatus response) (responseHeaders response)
 
 -- * URLs
 
@@ -175,21 +228,22 @@ data Url = Url
   , host   :: Host
   , port   :: Maybe Port
   , path   :: [PathSegment]
+  , query  :: Query
   }
   deriving stock (Show, Eq)
 
-{- | Extend the left URL's path with the right one's, keeping the left
-authority. This is @'/:'@ generalised to many segments, and the direction
-'Effectful.Http.Middleware.withBaseUrl' needs.
+{- | Extend the left URL's path and query with the right one's, keeping the
+left authority. This is @'/:'@ generalised to many segments, and the
+direction 'Effectful.Http.Middleware.withBaseUrl' needs.
 -}
 instance Semigroup Url where
-  a <> b = a{path = a.path <> b.path}
+  a <> b = a{path = a.path <> b.path, query = a.query <> b.query}
 
 http :: Host -> Url
-http h = Url Http h Nothing []
+http host = Url{scheme = Http, host, port = Nothing, path = [], query = []}
 
 https :: Host -> Url
-https h = Url Https h Nothing []
+https host = Url{scheme = Https, host, port = Nothing, path = [], query = []}
 
 withPort :: Word16 -> Url -> Url
 withPort p u = u{port = Just (Port p)}
@@ -199,9 +253,19 @@ u /: segment = u{path = u.path <> [segment]}
 
 infixl 5 /:
 
+-- | Append query parameters, keeping whatever the URL already carried.
+(/?) :: Url -> Query -> Url
+u /? params = u{query = u.query <> params}
+
+infixl 5 /?
+
 render :: Url -> Text
-render Url{scheme, host, port, path} =
-  prefix scheme <> coerce host <> maybe "" renderPort port <> renderPath path
+render Url{scheme, host, port, path, query} =
+  prefix scheme
+    <> coerce host
+    <> maybe "" renderPort port
+    <> renderPath path
+    <> decodeUtf8 (renderQuery True query)
  where
   prefix Http  = "http://"
   prefix Https = "https://"
@@ -220,8 +284,7 @@ data Request = Request
   { method    :: Method
   , url       :: Url
   , headers   :: [Header]
-  , query     :: Query
-  , body      :: Body
+  , body      :: RequestBody
   , timeout   :: Timeout
   , redirects :: Redirects
   }
@@ -240,7 +303,7 @@ data Redirects
 
 -- | A bodiless request with http-client's defaults, ready for 'applyArg'.
 request :: Method -> Url -> Request
-request method url = Request method url [] [] NoBody DefaultTimeout (FollowUpTo 10)
+request method url = Request method url [] NoBody DefaultTimeout (FollowUpTo 10)
 
 header :: HeaderName -> ByteString -> Header
 header = (,)
@@ -253,11 +316,11 @@ param k v = [(k, Just v)]
 
 -- * Request bodies
 
-data Body
+data RequestBody
   = NoBody
   | Bytes Lazy.ByteString
   | Built Int64 Builder
-  | Json Lazy.ByteString
+  | JsonBody Lazy.ByteString
   | Form Query
   | {- | Replayable as long as the parts are: 'formDataBody' asks each part
     for its body afresh, so file- and byte-backed parts survive a retry.
@@ -275,16 +338,16 @@ send, so replaying one puts a truncated or empty body on the wire —
 data Replay = Replayable | OneShot
   deriving stock (Show, Eq)
 
-replay :: Body -> Replay
+replay :: RequestBody -> Replay
 replay = \case
   Streamed{}        -> OneShot
   StreamedChunked{} -> OneShot
   _                 -> Replayable
 
-jsonBody :: (ToJSON a) => a -> Body
-jsonBody = Json . encode
+jsonBody :: (ToJSON a) => a -> RequestBody
+jsonBody = JsonBody . encode
 
-strictBody :: ByteString -> Body
+strictBody :: ByteString -> RequestBody
 strictBody = Bytes . fromStrict
 
 -- * Assembling arguments
@@ -292,16 +355,16 @@ strictBody = Bytes . fromStrict
 class Applies a where
   applyArg :: a -> Request -> Request
 
-instance Applies Body where applyArg body r = r{body}
-instance Applies Header where applyArg h r = r{headers = h : r.headers}
-instance Applies [Header] where applyArg hs r = r{headers = hs <> r.headers}
-instance Applies Query where applyArg q r = r{query = q <> r.query}
+instance Applies RequestBody where applyArg body r = r{body}
+instance Applies Header where applyArg h r = r{headers = r.headers <> [h]}
+instance Applies [Header] where applyArg hs r = r{headers = r.headers <> hs}
+instance Applies Query where applyArg q r = r{url = r.url{query = r.url.query <> q}}
 instance Applies Timeout where applyArg timeout r = r{timeout}
 instance Applies Redirects where applyArg redirects r = r{redirects}
 
 {- | Accumulates 'Applies' arguments until the call site asks for a result.
-The instances below are the terminators: a 'Request' to hold onto, the raw
-'Exchange', or a decoded 'Outcome'.
+The instances below are the terminators: a 'Request' to hold onto, or a
+'fetch'ed and read 'Network.HTTP.Client.Response'.
 -}
 class HttpArgs r where
   collect :: Request -> r
@@ -312,11 +375,8 @@ instance (Applies a, HttpArgs r) => HttpArgs (a -> r) where
 instance HttpArgs Request where
   collect = id
 
-instance (Http :> es) => HttpArgs (Eff es Exchange) where
+instance (Http :> es, ResponseBody a) => HttpArgs (Eff es (Response a)) where
   collect = fetch
-
-instance (Http :> es, FromJSON a) => HttpArgs (Eff es (Outcome a)) where
-  collect = fmap decodeOutcome . fetch
 
 -- * Verbs
 
@@ -329,33 +389,76 @@ delete = collect . request methodDelete
 head = collect . request methodHead
 options = collect . request methodOptions
 
--- * Decoding a response
+-- * Reading a response
 
-data Outcome a
-  = Succeeded a
-  | -- | 2xx, but the body is not what the decoder expected; its complaint.
-    Undecodable (Response Lazy.ByteString) Text
-  | -- | The server answered, outside 2xx.
-    Rejected (Response Lazy.ByteString)
-  | Unanswered Failure
-  deriving stock (Show, Functor)
+{- | How to read a 'Network.HTTP.Client.Response' body, and — because a
+status is not meaningful without knowing what the caller wanted — what to do
+about a status outside 2xx. Choosing @a@ at the call site chooses the policy:
+'Data.ByteString.Lazy.ByteString' and 'Data.ByteString.ByteString' hand back
+whatever came, 'Json' refuses a refusal.
+-}
+class ResponseBody a where
+  readBody :: Response Lazy.ByteString -> Either HttpError a
 
-decodeOutcome :: (FromJSON a) => Exchange -> Outcome a
-decodeOutcome = \case
-  Failed failure -> Unanswered failure
-  Responded response
-    | statusIsSuccessful (responseStatus response) ->
-        either (Undecodable response . Text.pack) Succeeded . eitherDecode' $ responseBody response
-    | otherwise -> Rejected response
+instance ResponseBody Lazy.ByteString where
+  readBody = Right . responseBody
+
+instance ResponseBody ByteString where
+  readBody = Right . Lazy.toStrict . responseBody
+
+instance ResponseBody Text where
+  readBody response =
+    first (Unreadable response . Text.pack . show)
+      . decodeUtf8'
+      . Lazy.toStrict
+      $ responseBody response
+
+instance ResponseBody () where
+  readBody _ = Right ()
+
+{- | A JSON response, reached through @DerivingVia@ so a call site never
+writes the wrapper itself:
+
+@
+data User = User {name :: Text}
+  deriving stock (Generic)
+  deriving anyclass (FromJSON)
+  deriving ResponseBody via (Json User)
+@
+
+Refuses any status outside 2xx with 'Rejected' before it even tries to
+decode — a store's error document is not the shape @a@ promises.
+-}
+newtype Json a = Json a
+  deriving stock (Show)
+
+instance (FromJSON a) => ResponseBody (Json a) where
+  readBody = onlySuccess $ \response ->
+    first (Unreadable response . Text.pack) . fmap Json . eitherDecode' $ responseBody response
+
+{- | The status policy 'Json' and any reading like it wants: decline
+everything outside 2xx before the reading gets a chance to run.
+-}
+onlySuccess ::
+  (Response Lazy.ByteString -> Either HttpError a) ->
+  Response Lazy.ByteString ->
+  Either HttpError a
+onlySuccess readSuccess response
+  | statusIsSuccessful (responseStatus response) = readSuccess response
+  | otherwise = Left $ Rejected response
 
 -- * Running
 
-runHttp :: (IOE :> es) => Manager -> Eff (Http : es) a -> Eff es a
+{- | Read the wire once with @httpLbs@, then read the body the caller asked
+for. 'Network.HTTP.Client.Response' is a 'Functor', so rebuilding the
+response around the read body is @(<$ raw)@.
+-}
+runHttp :: (IOE :> es, Error HttpError :> es) => Manager -> Eff (Http : es) a -> Eff es a
 runHttp manager = interpret_ $ \(Fetch req) ->
-  try @HttpException (liftIO $ buildRequest req >>= flip httpLbs manager) <&> \case
-    Right response                        -> Responded response
-    Left (HttpExceptionRequest _ content) -> Failed $ Unreachable content
-    Left (InvalidUrlException _ reason)   -> Failed $ InvalidUrl $ Text.pack reason
+  try @HttpException (liftIO $ buildRequest req >>= flip httpLbs manager) >>= \case
+    Left (HttpExceptionRequest _ content) -> throwError $ Unreachable content
+    Left (InvalidUrlException _ reason)   -> throwError . InvalidUrl $ Text.pack reason
+    Right raw                             -> either throwError (\value -> pure $ value <$ raw) $ readBody raw
 
 {- | Assemble the wire request field by field. Nothing here round-trips
 through a URL string, so a 'Host' cannot be re-read as userinfo, a port, or
@@ -373,7 +476,7 @@ buildRequest req
           , Wire.port = maybe implicitPort (fromIntegral @Word16 . coerce) req.url.port
           , Wire.path = encodeUtf8 . nonEmptyPath $ renderPath req.url.path
           , Wire.requestHeaders = req.headers
-          , Wire.queryString = renderQuery True req.query
+          , Wire.queryString = renderQuery True req.url.query
           , Wire.responseTimeout = wireTimeout req.timeout
           , Wire.redirectCount = wireRedirects req.redirects
           }
@@ -420,12 +523,12 @@ wireRedirects = \case
   NoRedirects  -> 0
   FollowUpTo n -> max 0 n
 
-applyBody :: Body -> Wire.Request -> IO Wire.Request
+applyBody :: RequestBody -> Wire.Request -> IO Wire.Request
 applyBody = \case
   NoBody -> pure
   Bytes payload -> pure . carrying (RequestBodyLBS payload)
   Built len builder -> pure . carrying (RequestBodyBuilder len builder)
-  Json payload ->
+  JsonBody payload ->
     pure . carrying (RequestBodyLBS payload) . defaultContentType "application/json"
   Form params ->
     pure

@@ -56,7 +56,8 @@ import Data.ByteString            (ByteString)
 import Data.ByteString.Base64     qualified as Base64
 import Effectful
 import Effectful.Dispatch.Dynamic (interpose_)
-import Effectful.Http             (Exchange, Http (..), PathSegment, Redirects, Request (..), Timeout (TimeoutAfter), Url (..), fetch)
+import Effectful.Error.Static     (Error, throwError)
+import Effectful.Http             (Attempted, Http (..), HttpError, PathSegment, Redirects, Request (..), Timeout (TimeoutAfter), Url (..), attempted, fetch, tried)
 import Effectful.Http.Duration    (Duration)
 import Network.HTTP.Types         (Header, HeaderName, Query, hAuthorization, hUserAgent)
 
@@ -86,15 +87,20 @@ function.
 shaping :: (Http :> es) => (Request -> Request) -> Eff es a -> Eff es a
 shaping rewrite = interpose_ $ \(Fetch req) -> fetch (rewrite req)
 
-{- | Watch every exchange without altering it — the hook for logging, metrics
+{- | Watch every attempt without altering it — the hook for logging, metrics
 or tracing. Placed nearer the wire than 'Effectful.Http.Retry.withRetry'
 it sees each attempt; placed nearer the program it sees only the outcome.
+
+Non-altering includes the error: whatever 'HttpError' the wrapped 'fetch'
+throws (or does not) still reaches the caller unchanged, observed but not
+intercepted.
 -}
-withObserver :: (Http :> es) => (Request -> Exchange -> Eff es ()) -> Eff es a -> Eff es a
+withObserver ::
+  (Http :> es, Error HttpError :> es) => (Request -> Attempted -> Eff es ()) -> Eff es a -> Eff es a
 withObserver observe = interpose_ $ \(Fetch req) -> do
-  exchange <- fetch req
-  observe req exchange
-  pure exchange
+  outcome <- tried $ fetch req
+  observe req $ attempted outcome
+  either throwError pure outcome
 
 -- * Headers
 
@@ -145,7 +151,7 @@ withPathPrefix prefix = shaping $ \req -> req{url = req.url{path = prefix <> req
 
 -- | Add these query parameters to every request, keeping whatever it had.
 withQuery :: (Http :> es) => Query -> Eff es a -> Eff es a
-withQuery extra = shaping $ \req -> req{query = extra <> req.query}
+withQuery extra = shaping $ \req -> req{url = req.url{query = extra <> req.url.query}}
 
 -- * Transport
 
