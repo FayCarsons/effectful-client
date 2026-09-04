@@ -198,12 +198,12 @@ busyUntil after = responded 503 [(hRetryAfter, after)] ""
 asAttempted :: Exchange -> Attempted
 asAttempted = \case
   Responded response -> Answered (responseStatus response) (responseHeaders response)
-  Failed content      -> NoAnswer content
+  Failed content     -> NoAnswer content
 
 retryAfterOf :: ByteString -> Maybe Duration
 retryAfterOf after = case busyUntil after of
   Responded response -> retryAfter (responseHeaders response)
-  Failed _            -> Nothing
+  Failed _           -> Nothing
 
 -- * Generators
 

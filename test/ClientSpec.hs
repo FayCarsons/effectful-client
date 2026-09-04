@@ -1,8 +1,11 @@
+{-# LANGUAGE NoOverloadedLists #-}
 module ClientSpec (spec) where
 
 import Control.Monad             (void)
+import Data.Aeson                (decode, encode)
 import Data.ByteString.Lazy      qualified as Lazy
-import Data.Foldable             (traverse_)
+import Data.Either               (isLeft)
+import Data.Foldable             (for_)
 import Data.List.NonEmpty        (NonEmpty (..))
 import Data.Maybe                (fromMaybe, listToMaybe)
 import Data.Text                 (Text)
@@ -39,27 +42,88 @@ spec = do
 
   describe "validHost" $ do
     it "accepts registered names and IPv6 literals" $
-      traverse_ (`shouldSatisfy` validHost)
-        (["example.com", "localhost", "a-b.c_d~e", "127.0.0.1", "[::1]", "[fe80::1]"] :: [Text])
+      for_ ["example.com", "localhost", "a-b.c_d~e", "127.0.0.1", "[::1]", "[fe80::1]"] (`shouldSatisfy` validHost)
+
 
     {- Each of these was previously rendered into a URL string and handed back
     to parseRequest, which read it as an authority again. The first sent the
     request to attacker.com. -}
     it "rejects anything that could be re-read as a different destination" $
-      traverse_ (`shouldNotSatisfy` validHost)
-        ( [ "evil.com@attacker.com"
-          , "example.com/../../etc"
-          , "example.com#fragment"
-          , "example.com?q=1"
-          , "example.com:8080"
-          , "example.com\r\nX-Injected: 1"
-          , "example com"
-          , ""
-          , "["
-          , "[]"
-          ]
-            :: [Text]
-        )
+      for_
+        [ "evil.com@attacker.com"
+        , "example.com/../../etc"
+        , "example.com#fragment"
+        , "example.com?q=1"
+        , "example.com:8080"
+        , "example.com\r\nX-Injected: 1"
+        , "example com"
+        , ""
+        , "["
+        , "[]"
+        ]
+        (`shouldNotSatisfy` validHost)
+
+  describe "parseUrl" $ do
+    {- Every parsed segment is 'Encoded': what arrived percent-encoded has to
+    render back out exactly as it came, not escaped a second time. -}
+    it "reads every part of an authority" $
+      parseUrl "http://localhost:8080/v1/users?page=2"
+        `shouldBe` Right
+          (withPort 8080 (http "localhost") /: Encoded "v1" /: Encoded "users" /? [("page", Just "2")])
+
+    it "reads a dotted name, a hyphenated one and an IPv6 literal" $
+      for_ ["api.example.com", "my-service.internal", "[fe80::1]"] \host ->
+        fmap (.host) (parseUrl $ "https://" <> host) `shouldBe` Right (Host host)
+
+    it "leaves an escape as it found it, rather than encoding it again" $
+      parseUrl "https://example.com/a%20b" `shouldBe` Right (https "example.com" /: Encoded "a%20b")
+
+    it "round-trips whatever render writes" $
+      for_
+        [ "https://example.com"
+        , "https://example.com/"
+        , "http://127.0.0.1:5432/db/"
+        , "https://api.example.com/v1/a%20b/c?q=a%2Bb&flag&empty="
+        , "https://[::1]:8443/health"
+        ]
+        \raw -> fmap render (parseUrl raw) `shouldBe` Right raw
+
+
+    it "takes a query apart the way a query is written" $
+      fmap (.query) (parseUrl "https://example.com/?a=1&b=2&c")
+        `shouldBe` Right [("a", Just "1"), ("b", Just "2"), ("c", Nothing)]
+
+    it "keeps an implicit port implicit" $
+      fmap (.port) (parseUrl "https://example.com") `shouldBe` Right Nothing
+
+    {- Each of these would otherwise reach 'render' as a URL that names a
+    different destination, or none at all. -}
+    it "refuses what a Url cannot say" $
+      for_
+        [ "ftp://example.com"
+        , "example.com/v1"
+        , "https://"
+        , "https://evil.com@attacker.com"
+        , "https://example.com#fragment"
+        , "https://example.com:0"
+        , "https://example.com:99999"
+        , "https://example.com:99999999999999999999"
+        , "https://example.com:/v1"
+        , "https://example.com/a b"
+        , "https://example.com/a%2"
+        , "https://example.com/a%zz"
+        , "https://exa mple.com"
+        , "https://example.com\r\nX-Injected: 1"
+        , "https://[::1/health"
+        , "https://ünicode.example.com"
+        ]
+        \raw -> parseUrl raw `shouldSatisfy` isLeft
+
+
+    it "decodes from JSON and encodes back" $ do
+      decode "\"https://example.com/v1?a=1\""
+        `shouldBe` Just (https "example.com" /: Encoded "v1" /? [("a", Just "1")])
+      encode (https "example.com" /: "v1") `shouldBe` "\"https://example.com/v1\""
 
   describe "a request that cannot name its destination" $
     it "fails as a value, before any connection is attempted" $ do
@@ -144,8 +208,7 @@ spec = do
   describe "middleware" $ do
     it "applies the first of a stack closest to the program" $ do
       req <-
-        sent
-          (mconcat [Middleware (withPathPrefix ["inner"]), Middleware (withPathPrefix ["outer"])])
+        sent (mconcat [Middleware (withPathPrefix ["inner"]), Middleware (withPathPrefix ["outer"])])
       req.url.path `shouldBe` ["outer", "inner", "users"]
 
     it "lets withHeaders replace what the request set" $ do
@@ -185,7 +248,7 @@ sent stack = do
       $ void asking
   case outcome of
     Right (_, requests) -> pure . fromMaybe (error "no request was made") $ listToMaybe requests
-    Left err             -> error $ "unexpected HttpError: " <> show err
+    Left err            -> error $ "unexpected HttpError: " <> show err
  where
   asking :: Eff '[Http, Error HttpError, IOE] (Response Lazy.ByteString)
   asking = get (url' /: "users") (header "Accept" "application/json")

@@ -46,6 +46,8 @@ module Effectful.Http (
   runHttp,
 
   -- * URLs
+
+  -- | Re-exported from "Effectful.Http.Url", which also carries 'renderPath'.
   Url (..),
   Scheme (..),
   Host (..),
@@ -57,6 +59,7 @@ module Effectful.Http (
   (/:),
   (/?),
   render,
+  parseUrl,
   validHost,
 
   -- * Requests
@@ -101,21 +104,20 @@ import Data.ByteString                       (ByteString)
 import Data.ByteString.Builder               (Builder)
 import Data.ByteString.Lazy                  (fromStrict)
 import Data.ByteString.Lazy                  qualified as Lazy
-import Data.Char                             (isAsciiLower, isAsciiUpper, isDigit, isHexDigit)
 import Data.Coerce                           (coerce)
 import Data.Int                              (Int64)
-import Data.String                           (IsString (..))
 import Data.Text                             (Text)
 import Data.Text                             qualified as Text
-import Data.Text.Encoding                    (decodeUtf8, decodeUtf8', encodeUtf8)
+import Data.Text.Encoding                    (decodeUtf8', encodeUtf8)
 import Data.Word                             (Word16)
 import Effectful
 import Effectful.Dispatch.Dynamic            (interpret_, send)
 import Effectful.Error.Static                (Error, throwError, tryError)
 import Effectful.Exception                   (try)
 import Effectful.Http.Duration               (Duration, toMicroseconds)
+import Effectful.Http.Url
 import GHC.Stack                             (HasCallStack)
-import Network.HTTP.Client                   hiding (Request, RequestBody, path, port)
+import Network.HTTP.Client                   hiding (Request, RequestBody, parseUrl, path, port)
 import Network.HTTP.Client                   qualified as Wire
 import Network.HTTP.Client.MultipartFormData (Part, formDataBody)
 import Network.HTTP.Types
@@ -190,93 +192,9 @@ attempted = \case
   Left (InvalidUrl reason)     -> Unsent reason
   Left (Rejected response)     -> answered response
   Left (Unreadable response _) -> answered response
-  Right response                -> answered response
+  Right response               -> answered response
  where
   answered response = Answered (responseStatus response) (responseHeaders response)
-
--- * URLs
-
-data Scheme = Http | Https
-  deriving stock (Show, Eq)
-
-newtype Host = Host Text
-  deriving newtype (Show, Eq, IsString)
-
-newtype Port = Port Word16
-  deriving newtype (Show, Eq)
-
-{- | One segment of a path, never containing a @\/@ of its own: 'render'
-inserts the separators.
-
-'Segment' is percent-encoded on the way out and is what a string literal
-means. 'Encoded' is passed through untouched, for the callers that must
-decide the bytes themselves — an API that signs the URL it receives, such as
-S3's SigV4, rejects the request when the encoding it would have chosen and
-the one on the wire disagree, and the encoding here is http-types', which
-leaves @:\@&=+$,@ unescaped.
--}
-data PathSegment
-  = Segment Text
-  | Encoded Text
-  deriving stock (Show, Eq)
-
-instance IsString PathSegment where
-  fromString = Segment . Text.pack
-
-data Url = Url
-  { scheme :: Scheme
-  , host   :: Host
-  , port   :: Maybe Port
-  , path   :: [PathSegment]
-  , query  :: Query
-  }
-  deriving stock (Show, Eq)
-
-{- | Extend the left URL's path and query with the right one's, keeping the
-left authority. This is @'/:'@ generalised to many segments, and the
-direction 'Effectful.Http.Middleware.withBaseUrl' needs.
--}
-instance Semigroup Url where
-  a <> b = a{path = a.path <> b.path, query = a.query <> b.query}
-
-http :: Host -> Url
-http host = Url{scheme = Http, host, port = Nothing, path = [], query = []}
-
-https :: Host -> Url
-https host = Url{scheme = Https, host, port = Nothing, path = [], query = []}
-
-withPort :: Word16 -> Url -> Url
-withPort p u = u{port = Just (Port p)}
-
-(/:) :: Url -> PathSegment -> Url
-u /: segment = u{path = u.path <> [segment]}
-
-infixl 5 /:
-
--- | Append query parameters, keeping whatever the URL already carried.
-(/?) :: Url -> Query -> Url
-u /? params = u{query = u.query <> params}
-
-infixl 5 /?
-
-render :: Url -> Text
-render Url{scheme, host, port, path, query} =
-  prefix scheme
-    <> coerce host
-    <> maybe "" renderPort port
-    <> renderPath path
-    <> decodeUtf8 (renderQuery True query)
- where
-  prefix Http  = "http://"
-  prefix Https = "https://"
-  renderPort (Port p) = ":" <> Text.pack (show p)
-
-renderPath :: [PathSegment] -> Text
-renderPath = foldMap segment
- where
-  segment (Segment raw) = "/" <> decodeUtf8 (urlEncode False (encodeUtf8 raw))
-  segment (Encoded raw) = "/" <> raw
-
 
 -- * Requests
 
@@ -490,27 +408,6 @@ buildRequest req
     -- non-emptiness before this point. Coercing to "/" also seems wrong
     | Text.null rendered = "/"
     | otherwise = rendered
-
-{- | Whether a 'Host' can stand as the authority on its own. A registered
-name may carry only unreserved characters, and an IPv6 literal must be
-bracketed. Everything else — @\@@, @\/@, @#@, @?@, whitespace, CR and LF —
-would change which server the request reaches or what the request line says,
-so it is rejected rather than escaped.
-
-Punycode an internationalised domain before it gets here; the Host header
-carries no encoding of its own.
--}
-validHost :: Text -> Bool
-validHost raw = case Text.uncons raw of
-  Nothing          -> False
-  Just ('[', rest) -> bracketed rest
-  _                -> Text.all registered raw
- where
-  bracketed rest = case Text.unsnoc rest of
-    Just (inner, ']') -> not (Text.null inner) && Text.all ipv6 inner
-    _                 -> False
-  ipv6 c = isHexDigit c || c == ':' || c == '.'
-  registered c = isAsciiLower c || isAsciiUpper c || isDigit c || c `elem` ("-._~" :: [Char])
 
 wireTimeout :: Timeout -> ResponseTimeout
 wireTimeout = \case
