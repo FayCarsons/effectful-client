@@ -11,7 +11,7 @@ import Data.Text               qualified as Text
 import Effectful
 import Effectful.Concurrent    (runConcurrent)
 import Effectful.Error.Static  (runErrorNoCallStack, tryError)
-import Effectful.Http          (Attempted (..), HttpError, Request (..), RequestBody (NoBody, Streamed), fetch, https, request)
+import Effectful.Http          (Attempted (..), Error, Request (..), RequestBody (NoBody, Streamed), fetch, https, request)
 import Effectful.Http.Duration (Duration, milliseconds, seconds)
 import Effectful.Http.Retry
 import Hedgehog                (Gen, PropertyT, forAll, forAllWith, (===))
@@ -148,7 +148,7 @@ spec = do
 {- | How many requests reached the wire, after @policy@ had its say. Delays
 are pinned to zero so the suite stays fast.
 
-'HttpError' is caught locally, inside the scripted 'Http' scope, so a final
+'Error' is caught locally, inside the scripted 'Http' scope, so a final
 give-up that re-throws does not cost the caller the count of requests
 already made.
 -}
@@ -156,10 +156,10 @@ sends :: RetryPolicy -> Request -> NonEmpty Exchange -> IO Int
 sends policy req script =
   fmap (either (const 0) (length . snd))
     . runEff
-    . runErrorNoCallStack @HttpError
+    . runErrorNoCallStack @Error
     . runConcurrent
     . runScripted script
-    $ void . fmap (first snd) . tryError @HttpError $ withRetry policy (fetch @Lazy.ByteString req)
+    $ void . fmap (first snd) . tryError @Error $ withRetry policy (fetch @Lazy.ByteString req)
 
 -- | 'Nothing' if the action slept when it should not have.
 finishes :: IO a -> IO (Maybe a)

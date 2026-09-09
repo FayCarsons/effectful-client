@@ -10,7 +10,8 @@ import Data.List.NonEmpty        (NonEmpty (..))
 import Data.Maybe                (fromMaybe, listToMaybe)
 import Data.Text                 (Text)
 import Effectful
-import Effectful.Error.Static    (Error, runErrorNoCallStack)
+import Effectful.Error.Static    (runErrorNoCallStack)
+import Effectful.Error.Static    qualified as Eff
 import Effectful.Http
 import Effectful.Http.Middleware
 import Network.HTTP.Client       (Response, defaultManagerSettings, newManager)
@@ -129,7 +130,7 @@ spec = do
     it "fails as a value, before any connection is attempted" $ do
       manager <- newManager defaultManagerSettings
       outcome <-
-        runEff . runErrorNoCallStack @HttpError . runHttp manager . fetch @Lazy.ByteString $
+        runEff . runErrorNoCallStack @Error . runHttp manager . fetch @Lazy.ByteString $
           request methodGet (https "evil.com@attacker.com" /: "users")
       outcome `shouldSatisfy` \case
         Left (InvalidUrl _) -> True
@@ -238,17 +239,17 @@ url' = https "example.com"
 asks for @\/users@ and names its own @Accept@, so both the overriding and the
 deferring header middleware have something to act on.
 -}
-sent :: Middleware '[Http, Error HttpError, IOE] -> IO Request
+sent :: Middleware '[Http, Eff.Error Error, IOE] -> IO Request
 sent stack = do
   outcome <-
     runEff
-      . runErrorNoCallStack @HttpError
+      . runErrorNoCallStack @Error
       . runScripted (responded 200 [] "{}" :| [])
       . apply stack
       $ void asking
   case outcome of
     Right (_, requests) -> pure . fromMaybe (error "no request was made") $ listToMaybe requests
-    Left err            -> error $ "unexpected HttpError: " <> show err
+    Left err            -> error $ "unexpected Error: " <> show err
  where
-  asking :: Eff '[Http, Error HttpError, IOE] (Response Lazy.ByteString)
+  asking :: Eff '[Http, Eff.Error Error, IOE] (Response Lazy.ByteString)
   asking = get (url' /: "users") (header "Accept" "application/json")

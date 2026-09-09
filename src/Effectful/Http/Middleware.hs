@@ -56,8 +56,9 @@ import Data.ByteString            (ByteString)
 import Data.ByteString.Base64     qualified as Base64
 import Effectful
 import Effectful.Dispatch.Dynamic (interpose_)
-import Effectful.Error.Static     (Error, throwError)
-import Effectful.Http             (Attempted, Http (..), HttpError, PathSegment, Redirects, Request (..), Timeout (TimeoutAfter), Url (..), attempted, fetch, tried)
+import Effectful.Error.Static     (throwError)
+import Effectful.Error.Static     qualified as Eff
+import Effectful.Http             (Attempted, Error, Http (..), PathSegment, Redirects, Request (..), Timeout (TimeoutAfter), Url (..), attempted, fetch, tried)
 import Effectful.Http.Duration    (Duration)
 import Network.HTTP.Types         (Header, HeaderName, Query, hAuthorization, hUserAgent)
 
@@ -91,12 +92,12 @@ shaping rewrite = interpose_ $ \(Fetch req) -> fetch (rewrite req)
 or tracing. Placed nearer the wire than 'Effectful.Http.Retry.withRetry'
 it sees each attempt; placed nearer the program it sees only the outcome.
 
-Non-altering includes the error: whatever 'HttpError' the wrapped 'fetch'
+Non-altering includes the error: whatever 'Error' the wrapped 'fetch'
 throws (or does not) still reaches the caller unchanged, observed but not
 intercepted.
 -}
 withObserver ::
-  (Http :> es, Error HttpError :> es) => (Request -> Attempted -> Eff es ()) -> Eff es a -> Eff es a
+  (Http :> es, Eff.Error Error :> es) => (Request -> Attempted -> Eff es ()) -> Eff es a -> Eff es a
 withObserver observe = interpose_ $ \(Fetch req) -> do
   outcome <- tried $ fetch req
   observe req $ attempted outcome

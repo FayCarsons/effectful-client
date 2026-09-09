@@ -24,10 +24,11 @@ module Effectful.Http.Url (
   render,
   renderPath,
   validHost,
+  parseUrl
 ) where
 
 import Data.Aeson         (FromJSON (..), ToJSON (..), Value (String), withText)
-import Data.Char          (digitToInt, isAscii, isAsciiLower, isAsciiUpper, isDigit, isHexDigit)
+import Data.Char          (digitToInt, isDigit, isHexDigit)
 import Data.Char          qualified as Char
 import Data.Coerce        (coerce)
 import Data.String        (IsString (..))
@@ -132,6 +133,15 @@ and a round trip through 'render' cannot escape a @%@ a second time. That
 also makes ASCII the whole alphabet: punycode an internationalised host and
 percent-encode the rest before handing the text over.
 -}
+
+parseUrl :: Text -> Either Text Url
+parseUrl text
+  | not $ Text.isAscii text = Left "url is not ASCII"
+  | otherwise =
+    case Parse.runParser urlParser $ encodeUtf8 text of
+      OK url _ -> Right url
+      Err why  -> Left why
+      Fail     -> Left "malformed url"
 
 instance FromJSON Url where
   parseJSON = withText "Url" \text ->

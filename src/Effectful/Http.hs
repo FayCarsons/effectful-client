@@ -7,7 +7,7 @@ rather than another field on the interpreter. See
 canonical ones.
 
 Failure is 'Effectful.Error.Static.Error', not a value threaded through the
-return type: 'runHttp' throws 'HttpError' at the wire, and a middleware
+return type: 'runHttp' throws 'Error' at the wire, and a middleware
 built with 'Effectful.Error.Static.tryError' pattern matches on what went
 wrong instead of wrapping itself in @catch@, which is what makes a retry
 loop readable.
@@ -38,7 +38,7 @@ Requests are built variadically. 'collect' accumulates any number of
 module Effectful.Http (
   -- * The effect
   Http (..),
-  HttpError (..),
+  Error (..),
   Attempted (..),
   attempted,
   tried,
@@ -112,7 +112,8 @@ import Data.Text.Encoding                    (decodeUtf8', encodeUtf8)
 import Data.Word                             (Word16)
 import Effectful
 import Effectful.Dispatch.Dynamic            (interpret_, send)
-import Effectful.Error.Static                (Error, throwError, tryError)
+import Effectful.Error.Static                (throwError, tryError)
+import Effectful.Error.Static                qualified as Eff
 import Effectful.Exception                   (try)
 import Effectful.Http.Duration               (Duration, toMicroseconds)
 import Effectful.Http.Url
@@ -134,7 +135,7 @@ data Http :: Effect where
 type instance DispatchOf Http = Dynamic
 
 -- | Why a 'fetch' did not deliver what was asked for.
-data HttpError
+data Error
   = {- | The request reached the network stack and no usable response came
     back: refused, reset, TLS rejected, timed out.
     -}
@@ -150,7 +151,7 @@ data HttpError
     Unreadable (Response Lazy.ByteString) Text
   deriving stock (Show)
 
-{- | Sending is all this asks for. Throwing 'HttpError' is an obligation of
+{- | Sending is all this asks for. Throwing 'Error' is an obligation of
 the interpretation, not of the operation — 'runHttp' takes it on, and an
 interpreter that answers from a script need not — so the constraint belongs
 on 'runHttp' and on the middleware that catches, and not here.
@@ -182,11 +183,11 @@ middleware that has to look before it decides. The call stack
 'Classifier' has no use for it, and 'throwError' would attach a fresh one on
 the way back out anyway.
 -}
-tried :: (Error HttpError :> es) => Eff es a -> Eff es (Either HttpError a)
+tried :: (Eff.Error Error :> es) => Eff es a -> Eff es (Either Error a)
 tried = fmap (first snd) . tryError
 
 -- | Collapse a read 'fetch' down to what a retry or an observer may see.
-attempted :: Either HttpError (Response a) -> Attempted
+attempted :: Either Error (Response a) -> Attempted
 attempted = \case
   Left (Unreachable content)   -> NoAnswer content
   Left (InvalidUrl reason)     -> Unsent reason
@@ -316,7 +317,7 @@ about a status outside 2xx. Choosing @a@ at the call site chooses the policy:
 whatever came, 'Json' refuses a refusal.
 -}
 class ResponseBody a where
-  readBody :: Response Lazy.ByteString -> Either HttpError a
+  readBody :: Response Lazy.ByteString -> Either Error a
 
 instance ResponseBody Lazy.ByteString where
   readBody = Right . responseBody
@@ -358,9 +359,9 @@ instance (FromJSON a) => ResponseBody (Json a) where
 everything outside 2xx before the reading gets a chance to run.
 -}
 onlySuccess ::
-  (Response Lazy.ByteString -> Either HttpError a) ->
+  (Response Lazy.ByteString -> Either Error a) ->
   Response Lazy.ByteString ->
-  Either HttpError a
+  Either Error a
 onlySuccess readSuccess response
   | statusIsSuccessful (responseStatus response) = readSuccess response
   | otherwise = Left $ Rejected response
@@ -371,7 +372,7 @@ onlySuccess readSuccess response
 for. 'Network.HTTP.Client.Response' is a 'Functor', so rebuilding the
 response around the read body is @(<$ raw)@.
 -}
-runHttp :: (IOE :> es, Error HttpError :> es) => Manager -> Eff (Http : es) a -> Eff es a
+runHttp :: (IOE :> es, Eff.Error Error :> es) => Manager -> Eff (Http : es) a -> Eff es a
 runHttp manager = interpret_ $ \(Fetch req) ->
   try @HttpException (liftIO $ buildRequest req >>= flip httpLbs manager) >>= \case
     Left (HttpExceptionRequest _ content) -> throwError $ Unreachable content
@@ -404,8 +405,6 @@ buildRequest req
   encrypted = req.url.scheme == Https
   implicitPort = if encrypted then 443 else 80
   nonEmptyPath rendered
-    -- NOTE: Is this branch reachable? I feel that we should enforce
-    -- non-emptiness before this point. Coercing to "/" also seems wrong
     | Text.null rendered = "/"
     | otherwise = rendered
 
