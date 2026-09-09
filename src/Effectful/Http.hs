@@ -113,7 +113,7 @@ import Data.Word                             (Word16)
 import Effectful
 import Effectful.Dispatch.Dynamic            (interpret_, send)
 import Effectful.Error.Static                (throwError, tryError)
-import Effectful.Error.Static                qualified as Eff
+import Effectful.Error.Static                qualified as ErrorEff
 import Effectful.Exception                   (try)
 import Effectful.Http.Duration               (Duration, toMicroseconds)
 import Effectful.Http.Url
@@ -183,7 +183,7 @@ middleware that has to look before it decides. The call stack
 'Classifier' has no use for it, and 'throwError' would attach a fresh one on
 the way back out anyway.
 -}
-tried :: (Eff.Error Error :> es) => Eff es a -> Eff es (Either Error a)
+tried :: (ErrorEff.Error Error :> es) => Eff es a -> Eff es (Either Error a)
 tried = fmap (first snd) . tryError
 
 -- | Collapse a read 'fetch' down to what a retry or an observer may see.
@@ -372,7 +372,7 @@ onlySuccess readSuccess response
 for. 'Network.HTTP.Client.Response' is a 'Functor', so rebuilding the
 response around the read body is @(<$ raw)@.
 -}
-runHttp :: (IOE :> es, Eff.Error Error :> es) => Manager -> Eff (Http : es) a -> Eff es a
+runHttp :: (IOE :> es, ErrorEff.Error Error :> es) => Manager -> Eff (Http : es) a -> Eff es a
 runHttp manager = interpret_ $ \(Fetch req) ->
   try @HttpException (liftIO $ buildRequest req >>= flip httpLbs manager) >>= \case
     Left (HttpExceptionRequest _ content) -> throwError $ Unreachable content

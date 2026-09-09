@@ -21,9 +21,9 @@ import Data.List.NonEmpty           qualified as NonEmpty
 import Data.Maybe                   (fromMaybe)
 import Effectful
 import Effectful.Dispatch.Dynamic   (reinterpret_)
-import Effectful.Error.Static       (throwError)
-import Effectful.Error.Static       qualified as Eff
-import Effectful.Http               (Error (Unreachable), Http (..), Request, ResponseBody (readBody))
+import Effectful.Error.Static       (Error, throwError)
+import Effectful.Http               (Http (..), Request, ResponseBody (readBody))
+import Effectful.Http               qualified as Http
 import Effectful.State.Static.Local (State, get, put, runState)
 import Network.HTTP.Client          (HttpExceptionContent)
 import Network.HTTP.Client.Internal qualified as Wire
@@ -38,7 +38,7 @@ data Exchange
 hand back every 'Request' that was made in the order it was made.
 -}
 runScripted ::
-  (Eff.Error Error :> es) =>
+  (Error Http.Error :> es) =>
   NonEmpty Exchange ->
   Eff (Http : es) a ->
   Eff es (a, [Request])
@@ -46,14 +46,14 @@ runScripted script action =
   second (reverse . snd) <$> reinterpret_ (runState (script, [])) serve action
 
 serve ::
-  (Eff.Error Error :> es, State (NonEmpty Exchange, [Request]) :> es) =>
+  (Error Http.Error :> es, State (NonEmpty Exchange, [Request]) :> es) =>
   Http m a ->
   Eff es a
 serve (Fetch req) = do
   (remaining, seen) <- get
   put (advance remaining, req : seen)
   case NonEmpty.head remaining of
-    Failed content     -> throwError $ Unreachable content
+    Failed content     -> throwError $ Http.Unreachable content
     Responded response -> either throwError (\value -> pure $ value <$ response) $ readBody response
  where
   advance (next :| rest) = fromMaybe [next] (nonEmpty rest)

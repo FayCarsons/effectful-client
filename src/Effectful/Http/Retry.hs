@@ -64,9 +64,9 @@ import Data.Functor               (($>))
 import Effectful
 import Effectful.Concurrent       (Concurrent)
 import Effectful.Dispatch.Dynamic (interpose_)
-import Effectful.Error.Static     (throwError)
-import Effectful.Error.Static     qualified as Eff
-import Effectful.Http             (Attempted (..), Error, Http (..), Replay (Replayable), Request (..), attempted, fetch, replay, tried)
+import Effectful.Error.Static     (Error, throwError)
+import Effectful.Http             (Attempted (..), Http (..), Replay (Replayable), Request (..), attempted, fetch, replay, tried)
+import Effectful.Http             qualified as Http
 import Effectful.Http.Duration    (Duration, delay, milliseconds, scale, seconds)
 import Network.HTTP.Client        (HttpExceptionContent (..))
 import Network.HTTP.Types
@@ -101,7 +101,7 @@ randomness effect, and any program that reaches the wire has 'IOE' anyway.
 -}
 withRetry ::
   forall es a.
-  (Concurrent :> es, Http :> es, Eff.Error Error :> es, IOE :> es) =>
+  (Concurrent :> es, Http :> es, Error Http.Error :> es, IOE :> es) =>
   RetryPolicy ->
   Eff es a ->
   Eff es a

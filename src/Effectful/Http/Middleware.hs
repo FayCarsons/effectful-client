@@ -23,8 +23,6 @@ above, is re-applied on every attempt — which is what a signature over a
 timestamp, or a token that may have been refreshed, requires. Auth placed
 before it is computed once and replayed verbatim.
 -}
--- FIXME: We should, at the very least, define our own lenses if not pull in
--- the `optics` library in order to make the functions in this module more readable
 module Effectful.Http.Middleware (
   -- * Composing
   Middleware (..),
@@ -56,9 +54,9 @@ import Data.ByteString            (ByteString)
 import Data.ByteString.Base64     qualified as Base64
 import Effectful
 import Effectful.Dispatch.Dynamic (interpose_)
-import Effectful.Error.Static     (throwError)
-import Effectful.Error.Static     qualified as Eff
-import Effectful.Http             (Attempted, Error, Http (..), PathSegment, Redirects, Request (..), Timeout (TimeoutAfter), Url (..), attempted, fetch, tried)
+import Effectful.Error.Static     (Error, throwError)
+import Effectful.Http             (Attempted, Http (..), PathSegment, Redirects, Request (..), Timeout (TimeoutAfter), Url (..), attempted, fetch, tried)
+import Effectful.Http             qualified as Http
 import Effectful.Http.Duration    (Duration)
 import Network.HTTP.Types         (Header, HeaderName, Query, hAuthorization, hUserAgent)
 
@@ -97,7 +95,7 @@ throws (or does not) still reaches the caller unchanged, observed but not
 intercepted.
 -}
 withObserver ::
-  (Http :> es, Eff.Error Error :> es) => (Request -> Attempted -> Eff es ()) -> Eff es a -> Eff es a
+  (Http :> es, Error Http.Error :> es) => (Request -> Attempted -> Eff es ()) -> Eff es a -> Eff es a
 withObserver observe = interpose_ $ \(Fetch req) -> do
   outcome <- tried $ fetch req
   observe req $ attempted outcome
