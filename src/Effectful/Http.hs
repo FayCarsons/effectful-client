@@ -97,7 +97,7 @@ module Effectful.Http (
   onlySuccess,
 ) where
 
-import Control.Exception                     (throwIO)
+import Control.Exception                     (handle, throwIO)
 import Data.Aeson                            (FromJSON, ToJSON, eitherDecode', encode)
 import Data.Bifunctor                        (first)
 import Data.ByteString                       (ByteString)
@@ -120,6 +120,7 @@ import Effectful.Http.Url
 import GHC.Stack                             (HasCallStack)
 import Network.HTTP.Client                   hiding (Request, RequestBody, parseUrl, path, port)
 import Network.HTTP.Client                   qualified as Wire
+import Network.HTTP.Client.Internal          (mWrapException, toHttpException)
 import Network.HTTP.Client.MultipartFormData (Part, formDataBody)
 import Network.HTTP.Types
 import Prelude                               hiding (head)
@@ -371,13 +372,24 @@ onlySuccess readSuccess response
 {- | Read the wire once with @httpLbs@, then read the body the caller asked
 for. 'Network.HTTP.Client.Response' is a 'Functor', so rebuilding the
 response around the read body is @(<$ raw)@.
+
+http-client applies the manager's exception wrapper only while it opens
+the response. @httpLbs@ reads the body afterwards, so a connection reset or
+a TLS failure in the middle of the body would escape unwrapped. 'exchange'
+applies the same wrapper to the whole exchange, so a failure in the body
+becomes 'Unreachable' exactly as one in the headers does. The manager
+decides which exceptions are transport failures: @http-client-tls@ adds
+TLS and DNS failures to http-client's 'IOException'.
 -}
 runHttp :: (IOE :> es, ErrorEff.Error Error :> es) => Manager -> Eff (Http : es) a -> Eff es a
 runHttp manager = interpret_ $ \(Fetch req) ->
-  try @HttpException (liftIO $ buildRequest req >>= flip httpLbs manager) >>= \case
+  try @HttpException (liftIO $ buildRequest req >>= exchange) >>= \case
     Left (HttpExceptionRequest _ content) -> throwError $ Unreachable content
     Left (InvalidUrlException _ reason)   -> throwError . InvalidUrl $ Text.pack reason
     Right raw                             -> either throwError (\value -> pure $ value <$ raw) $ readBody raw
+ where
+  exchange wire =
+    handle (throwIO . toHttpException wire) . mWrapException manager wire $ httpLbs wire manager
 
 {- | Assemble the wire request field by field. Nothing here round-trips
 through a URL string, so a 'Host' cannot be re-read as userinfo, a port, or

@@ -134,6 +134,7 @@ test-suite effectful-client-test
   main-is:          Main.hs
   other-modules:
       ClientSpec
+    , ResetSpec
     , RetrySpec
     , Scripted
   build-depends:
@@ -148,4 +149,5 @@ test-suite effectful-client-test
     , hspec-hedgehog      >=0.3     && <0.4
     , http-client
     , http-types
+    , network             >=3.2     && <3.3
     , text
