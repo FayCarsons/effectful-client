@@ -6,13 +6,13 @@ A scripted answer is read with 'readBody' exactly as 'Effectful.Http.runHttp'
 reads a real one, so a script exercises decoding too: ask for a 'Json' body
 and a scripted 4xx throws 'Rejected' here just as it would over the wire.
 -}
-module Scripted (
-  Exchange (..),
-  runScripted,
-  rawResponse,
-  responded,
-  unreachable,
-) where
+module Scripted
+  ( Exchange (..)
+  , runScripted
+  , rawResponse
+  , responded
+  , unreachable
+  ) where
 
 import Data.Bifunctor               (second)
 import Data.ByteString.Lazy         qualified as Lazy

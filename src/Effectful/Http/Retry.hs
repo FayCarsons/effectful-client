@@ -27,35 +27,32 @@ A request whose body is 'Effectful.Http.OneShot' is never retried, whatever the 
 says: the first send drains the popper, so a second would put an empty body
 on the wire.
 -}
-module Effectful.Http.Retry (
-  -- * Installing
-  withRetry,
-  RetryPolicy (..),
-  defaultRetryPolicy,
-
-  -- * Deciding whether
-  Verdict (..),
-  Classifier (..),
-  classify,
-  transient,
-  idempotentOnly,
-  never,
-  whenStatus,
-  retryAfter,
-
-  -- * Deciding when
-  Backoff (..),
-  Attempt (..),
-  constant,
-  exponential,
-  fibonacci,
-  limitRetries,
-  limitTotalDelay,
-  giveUp,
-
-  -- * Spreading the herd
-  Jitter (..),
-) where
+module Effectful.Http.Retry
+  ( -- * Installing
+    withRetry
+  , RetryPolicy (..)
+  , defaultRetryPolicy
+    -- * Deciding whether
+  , Verdict (..)
+  , Classifier (..)
+  , classify
+  , transient
+  , idempotentOnly
+  , never
+  , whenStatus
+  , retryAfter
+    -- * Deciding when
+  , Backoff (..)
+  , Attempt (..)
+  , constant
+  , exponential
+  , fibonacci
+  , limitRetries
+  , limitTotalDelay
+  , giveUp
+    -- * Spreading the herd
+  , Jitter (..)
+  ) where
 
 import Control.Monad              (guard)
 import Data.ByteString.Char8      qualified as Char8
@@ -79,7 +76,7 @@ data RetryPolicy = RetryPolicy
   , backoff      :: Backoff
   , jitter       :: Jitter
   , maximumDelay :: Duration
-  {- ^ Ceiling on any single sleep, applied last and therefore binding on a
+    {- ^ Ceiling on any single sleep, applied last and therefore binding on a
   server's @Retry-After@ too. A backoff can only constrain itself.
   -}
   }
@@ -105,8 +102,7 @@ withRetry ::
   RetryPolicy ->
   Eff es a ->
   Eff es a
-withRetry policy = interpose_ handle
- where
+withRetry policy = interpose_ handle where
   Backoff schedule = policy.backoff
 
   {- | Explicit and nested, rather than a sibling in this @where@ clause: the
@@ -116,8 +112,7 @@ withRetry policy = interpose_ handle
   it cannot see that scope.
   -}
   handle :: forall localEs answer. Http (Eff localEs) answer -> Eff es answer
-  handle (Fetch req) = attempt req (Attempt 1 mempty)
-   where
+  handle (Fetch req) = attempt req (Attempt 1 mempty) where
     attempt :: Request -> Attempt -> Eff es answer
     attempt req' counter = do
       outcome <- tried $ fetch req'
@@ -141,12 +136,12 @@ withRetry policy = interpose_ handle
 
 -- * Deciding whether
 data Verdict
-  = -- | This exchange is the answer; another attempt cannot improve it.
-    Deliver
+  -- | This exchange is the answer; another attempt cannot improve it.
+  = Deliver
   | Retry
-  | -- | The server named a delay, via @Retry-After@. Overrides the backoff's
-    -- for this attempt, but not 'maximumDelay'.
-    RetryAfter Duration
+  -- | The server named a delay, via @Retry-After@. Overrides the backoff's
+  -- for this attempt, but not 'maximumDelay'.
+  | RetryAfter Duration
   deriving stock (Show, Eq)
 
 {- | @'<>'@ tries the left classifier and falls through to the right on
@@ -252,11 +247,11 @@ retryAfter headers = do
 
 data Attempt = Attempt
   { number :: Int
-  {- ^ Which retry is under consideration: 1 is the first retry, so the
+    {- ^ Which retry is under consideration: 1 is the first retry, so the
   second time the request goes out.
   -}
   , waited :: Duration
-  -- ^ Total slept across the retries already made.
+    -- ^ Total slept across the retries already made.
   }
   deriving stock (Show, Eq)
 
@@ -312,12 +307,12 @@ giveUp = Backoff $ const Nothing
 
 data Jitter
   = NoJitter
-  | {- | Uniform over @[0, d]@. Spreads a thundering herd best, at the cost of
+  {- | Uniform over @[0, d]@. Spreads a thundering herd best, at the cost of
     occasionally retrying almost immediately.
     -}
-    FullJitter
-  | -- | Uniform over @[d/2, d]@. Keeps a floor under the delay.
-    EqualJitter
+  | FullJitter
+  -- | Uniform over @[d/2, d]@. Keeps a floor under the delay.
+  | EqualJitter
   deriving stock (Show, Eq)
 
 jittered :: (IOE :> es) => Jitter -> Duration -> Eff es Duration

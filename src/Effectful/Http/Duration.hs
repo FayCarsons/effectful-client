@@ -7,17 +7,17 @@ at zero and every operation saturates at 'Int64' microseconds — around
 292,000 years, which the doubling in 'Effectful.Http.Retry.exponential'
 would otherwise reach in about sixty attempts.
 -}
-module Effectful.Http.Duration (
-  Duration,
-  microseconds,
-  milliseconds,
-  seconds,
-  toMicroseconds,
-  fromNominalDiffTime,
-  toNominalDiffTime,
-  scale,
-  delay,
-) where
+module Effectful.Http.Duration
+  ( Duration
+  , microseconds
+  , milliseconds
+  , seconds
+  , toMicroseconds
+  , fromNominalDiffTime
+  , toNominalDiffTime
+  , scale
+  , delay
+  ) where
 
 import Data.Fixed           (Pico)
 import Data.Function

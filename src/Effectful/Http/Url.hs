@@ -10,22 +10,22 @@ a parsed path segment is 'Encoded', so a round trip does not escape a @%@
 that was already an escape — and both defer to 'validHost' on what may stand
 as the authority.
 -}
-module Effectful.Http.Url (
-  Url (..),
-  Scheme (..),
-  Host (..),
-  Port (..),
-  PathSegment (..),
-  http,
-  https,
-  withPort,
-  (/:),
-  (/?),
-  render,
-  renderPath,
-  validHost,
-  parseUrl
-) where
+module Effectful.Http.Url
+  ( Url (..)
+  , Scheme (..)
+  , Host (..)
+  , Port (..)
+  , PathSegment (..)
+  , http
+  , https
+  , withPort
+  , (/:)
+  , (/?)
+  , render
+  , renderPath
+  , validHost
+  , parseUrl
+  ) where
 
 import Data.Aeson         (FromJSON (..), ToJSON (..), Value (String), withText)
 import Data.Char          (digitToInt, isDigit, isHexDigit)
@@ -40,7 +40,9 @@ import FlatParse.Basic    (Parser, Result (..))
 import FlatParse.Basic    qualified as Parse
 import Network.HTTP.Types (Query, parseQuery, renderQuery, urlEncode)
 
-data Scheme = Http | Https
+data Scheme
+  = Http
+  | Https
   deriving stock (Show, Eq)
 
 newtype Host = Host Text
@@ -116,8 +118,7 @@ render Url{scheme, host, port, path, query} =
   renderPort (Port p) = ":" <> Text.pack (show p)
 
 renderPath :: [PathSegment] -> Text
-renderPath = foldMap segment
- where
+renderPath = foldMap segment where
   segment (Segment raw) = "/" <> decodeUtf8 (urlEncode False (encodeUtf8 raw))
   segment (Encoded raw) = "/" <> raw
 
@@ -137,6 +138,7 @@ percent-encode the rest before handing the text over.
 parseUrl :: Text -> Either Text Url
 parseUrl text
   | not $ Text.isAscii text = Left "url is not ASCII"
+  | Text.null text = Left "empty url"
   | otherwise =
     case Parse.runParser urlParser $ encodeUtf8 text of
       OK url _ -> Right url
@@ -163,7 +165,7 @@ urlParser = do
   path <- Parse.many $ $(Parse.char '/') *> segmentParser
   query <- Parse.branch $(Parse.char '?') queryParser $ pure []
   Parse.takeRest >>= exhausted . decodeUtf8
-  pure Url{scheme, host, port, path, query}
+  pure Url{..}
  where
   schemeParser = do
     name <- Parse.cut (spanOf schemeChar) "url has no scheme"
@@ -174,9 +176,9 @@ urlParser = do
   named "https" = pure Https
   named other   = Parse.err $ "unsupported scheme: " <> other
 
-  hostParser =
-    Parse.cut (Parse.branch $(Parse.char '[') bracketed $ spanOf regNameChar) "url has no host"
-      >>= addressed
+  hostParser = do
+    hostText <- Parse.cut (Parse.branch $(Parse.char '[') bracketed $ spanOf regNameChar) "url has no host"
+    addressed hostText
 
   bracketed = do
     inner <- spanOf ipv6Char

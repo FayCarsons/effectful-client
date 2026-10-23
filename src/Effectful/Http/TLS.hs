@@ -6,10 +6,10 @@ This module exists so that @http-client-tls@ — and with it the whole
 built under the @tls@ package flag, which is on by default; turn the flag off
 and supply 'Effectful.Http.runHttp' a 'Manager' built however you like.
 -}
-module Effectful.Http.TLS (
-  newHttpManager,
-  defaultHttpManager,
-) where
+module Effectful.Http.TLS
+  ( newHttpManager
+  , defaultHttpManager
+  ) where
 
 import Effectful
 import Network.HTTP.Client     (Manager, ManagerSettings)

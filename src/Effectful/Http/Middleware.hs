@@ -23,32 +23,28 @@ above, is re-applied on every attempt — which is what a signature over a
 timestamp, or a token that may have been refreshed, requires. Auth placed
 before it is computed once and replayed verbatim.
 -}
-module Effectful.Http.Middleware (
-  -- * Composing
-  Middleware (..),
-  apply,
-
-  -- * Building your own
-  shaping,
-  withObserver,
-
-  -- * Headers
-  withHeaders,
-  withDefaultHeaders,
-  withBearerAuth,
-  withBasicAuth,
-  withApiKey,
-  withUserAgent,
-
-  -- * Addressing
-  withBaseUrl,
-  withPathPrefix,
-  withQuery,
-
-  -- * Transport
-  withTimeout,
-  withRedirects,
-) where
+module Effectful.Http.Middleware
+  ( -- * Composing
+    Middleware (..)
+  , apply
+    -- * Building your own
+  , shaping
+  , withObserver
+    -- * Headers
+  , withHeaders
+  , withDefaultHeaders
+  , withBearerAuth
+  , withBasicAuth
+  , withApiKey
+  , withUserAgent
+    -- * Addressing
+  , withBaseUrl
+  , withPathPrefix
+  , withQuery
+    -- * Transport
+  , withTimeout
+  , withRedirects
+  ) where
 
 import Data.ByteString            (ByteString)
 import Data.ByteString.Base64     qualified as Base64

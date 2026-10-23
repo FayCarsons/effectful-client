@@ -35,69 +35,62 @@ response, or for @'Request'@ to build one without sending it.
 Requests are built variadically. 'collect' accumulates any number of
 'Applies' arguments and stops at whatever the call site asks for.
 -}
-module Effectful.Http (
-  -- * The effect
-  Http (..),
-  Error (..),
-  Attempted (..),
-  attempted,
-  tried,
-  fetch,
-  runHttp,
+module Effectful.Http
+  ( -- * The effect
+    Http (..)
+  , Error (..)
+  , Attempted (..)
+  , attempted
+  , tried
+  , fetch
+  , runHttp
+    -- * URLs
+    -- | Re-exported from "Effectful.Http.Url", which also carries 'renderPath'.
+  , Url (..)
+  , Scheme (..)
+  , Host (..)
+  , Port (..)
+  , PathSegment (..)
+  , http
+  , https
+  , withPort
+  , (/:)
+  , (/?)
+  , render
+  , parseUrl
+  , validHost
+    -- * Requests
+  , Request (..)
+  , Timeout (..)
+  , Redirects (..)
+  , request
+  , header
+  , contentType
+  , param
+    -- * Request bodies
+  , RequestBody (..)
+  , Replay (..)
+  , replay
+  , jsonBody
+  , strictBody
+    -- * Verbs
+  , get
+  , post
+  , put
+  , patch
+  , delete
+  , head
+  , options
+    -- * Assembling arguments
+  , HttpArgs (..)
+  , Applies (..)
+    -- * Reading a response
+  , ResponseBody (..)
+  , Json (..)
+  , onlySuccess
+  ) where
 
-  -- * URLs
-
-  -- | Re-exported from "Effectful.Http.Url", which also carries 'renderPath'.
-  Url (..),
-  Scheme (..),
-  Host (..),
-  Port (..),
-  PathSegment (..),
-  http,
-  https,
-  withPort,
-  (/:),
-  (/?),
-  render,
-  parseUrl,
-  validHost,
-
-  -- * Requests
-  Request (..),
-  Timeout (..),
-  Redirects (..),
-  request,
-  header,
-  contentType,
-  param,
-
-  -- * Request bodies
-  RequestBody (..),
-  Replay (..),
-  replay,
-  jsonBody,
-  strictBody,
-
-  -- * Verbs
-  get,
-  post,
-  put,
-  patch,
-  delete,
-  head,
-  options,
-
-  -- * Assembling arguments
-  HttpArgs (..),
-  Applies (..),
-
-  -- * Reading a response
-  ResponseBody (..),
-  Json (..),
-  onlySuccess,
-) where
-
-import Control.Exception                     (throwIO)
+import Control.Exception                     (handle, throwIO)
 import Data.Aeson                            (FromJSON, ToJSON, eitherDecode', encode)
 import Data.Bifunctor                        (first)
 import Data.ByteString                       (ByteString)
@@ -120,6 +113,7 @@ import Effectful.Http.Url
 import GHC.Stack                             (HasCallStack)
 import Network.HTTP.Client                   hiding (Request, RequestBody, parseUrl, path, port)
 import Network.HTTP.Client                   qualified as Wire
+import Network.HTTP.Client.Internal          (mWrapException, toHttpException)
 import Network.HTTP.Client.MultipartFormData (Part, formDataBody)
 import Network.HTTP.Types
 import Prelude                               hiding (head)
@@ -129,26 +123,25 @@ import Prelude                               hiding (head)
 {- | The one operation. Everything else in this package is either a way to
 build the 'Request' or a way to intercept the operation.
 -}
-data Http :: Effect where
-  Fetch :: (ResponseBody a) => Request -> Http m (Response a)
+data Http :: Effect where Fetch :: (ResponseBody a) => Request -> Http m (Response a)
 
 type instance DispatchOf Http = Dynamic
 
 -- | Why a 'fetch' did not deliver what was asked for.
 data Error
-  = {- | The request reached the network stack and no usable response came
+  {- | The request reached the network stack and no usable response came
     back: refused, reset, TLS rejected, timed out.
     -}
-    Unreachable HttpExceptionContent
-  | {- | Nothing was ever sent, because the destination could not be named:
+  = Unreachable HttpExceptionContent
+  {- | Nothing was ever sent, because the destination could not be named:
     a 'Host' that 'validHost' rejects, or a redirect to a @Location@ that
     http-client cannot parse.
     -}
-    InvalidUrl Text
-  | -- | The server answered outside 2xx, and the reading in question declines that.
-    Rejected (Response Lazy.ByteString)
-  | -- | The server answered, and the bytes were not what the reading expected.
-    Unreadable (Response Lazy.ByteString) Text
+  | InvalidUrl Text
+  -- | The server answered outside 2xx, and the reading in question declines that.
+  | Rejected (Response Lazy.ByteString)
+  -- | The server answered, and the bytes were not what the reading expected.
+  | Unreadable (Response Lazy.ByteString) Text
   deriving stock (Show)
 
 {- | Sending is all this asks for. Throwing 'Error' is an obligation of
@@ -170,10 +163,10 @@ identically whether the call site asked for raw bytes (arriving as a
 success) or for JSON (arriving as a thrown 'Rejected').
 -}
 data Attempted
-  = -- | Never left the process; no retry can help. 'InvalidUrl''s reason.
-    Unsent Text
-  | -- | Went out, nothing usable came back. 'Unreachable''s content.
-    NoAnswer HttpExceptionContent
+  -- | Never left the process; no retry can help. 'InvalidUrl''s reason.
+  = Unsent Text
+  -- | Went out, nothing usable came back. 'Unreachable''s content.
+  | NoAnswer HttpExceptionContent
   | Answered Status [Header]
   deriving stock (Show)
 
@@ -241,12 +234,12 @@ data RequestBody
   | Built Int64 Builder
   | JsonBody Lazy.ByteString
   | Form Query
-  | {- | Replayable as long as the parts are: 'formDataBody' asks each part
+  {- | Replayable as long as the parts are: 'formDataBody' asks each part
     for its body afresh, so file- and byte-backed parts survive a retry.
     -}
-    Multipart [Part]
-  | -- | Reopened on every send, so unlike 'Streamed' this can be retried.
-    FromFile FilePath
+  | Multipart [Part]
+  -- | Reopened on every send, so unlike 'Streamed' this can be retried.
+  | FromFile FilePath
   | Streamed Int64 (GivesPopper ())
   | StreamedChunked (GivesPopper ())
 
@@ -254,7 +247,9 @@ data RequestBody
 send, so replaying one puts a truncated or empty body on the wire —
 "Effectful.Http.Retry" consults this before retrying anything.
 -}
-data Replay = Replayable | OneShot
+data Replay
+  = Replayable
+  | OneShot
   deriving stock (Show, Eq)
 
 replay :: RequestBody -> Replay
@@ -371,13 +366,24 @@ onlySuccess readSuccess response
 {- | Read the wire once with @httpLbs@, then read the body the caller asked
 for. 'Network.HTTP.Client.Response' is a 'Functor', so rebuilding the
 response around the read body is @(<$ raw)@.
+
+http-client applies the manager's exception wrapper only while it opens
+the response. @httpLbs@ reads the body afterwards, so a connection reset or
+a TLS failure in the middle of the body would escape unwrapped. 'exchange'
+applies the same wrapper to the whole exchange, so a failure in the body
+becomes 'Unreachable' exactly as one in the headers does. The manager
+decides which exceptions are transport failures: @http-client-tls@ adds
+TLS and DNS failures to http-client's 'IOException'.
 -}
 runHttp :: (IOE :> es, ErrorEff.Error Error :> es) => Manager -> Eff (Http : es) a -> Eff es a
 runHttp manager = interpret_ $ \(Fetch req) ->
-  try @HttpException (liftIO $ buildRequest req >>= flip httpLbs manager) >>= \case
+  try @HttpException (liftIO $ buildRequest req >>= exchange) >>= \case
     Left (HttpExceptionRequest _ content) -> throwError $ Unreachable content
     Left (InvalidUrlException _ reason)   -> throwError . InvalidUrl $ Text.pack reason
     Right raw                             -> either throwError (\value -> pure $ value <$ raw) $ readBody raw
+ where
+  exchange wire =
+    handle (throwIO . toHttpException wire) . mWrapException manager wire $ httpLbs wire manager
 
 {- | Assemble the wire request field by field. Nothing here round-trips
 through a URL string, so a 'Host' cannot be re-read as userinfo, a port, or
