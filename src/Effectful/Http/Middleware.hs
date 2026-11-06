@@ -40,7 +40,7 @@ module Effectful.Http.Middleware
     -- * Addressing
   , withBaseUrl
   , withPathPrefix
-  , withQuery
+  , withQueryParams
     -- * Transport
   , withTimeout
   , withRedirects
@@ -51,10 +51,10 @@ import Data.ByteString.Base64     qualified as Base64
 import Effectful
 import Effectful.Dispatch.Dynamic (interpose_)
 import Effectful.Error.Static     (Error, throwError)
-import Effectful.Http             (Attempted, Http (..), PathSegment, Redirects, Request (..), Timeout (TimeoutAfter), Url (..), attempted, fetch, tried)
+import Effectful.Http             (Attempted, Http (..), Param, PathSegment, Redirects, Request (..), Timeout (TimeoutAfter), Url (..), attempted, fetch, tried, (<?>))
 import Effectful.Http             qualified as Http
 import Effectful.Http.Duration    (Duration)
-import Network.HTTP.Types         (Header, HeaderName, Query, hAuthorization, hUserAgent)
+import Network.HTTP.Types         (Header, HeaderName, hAuthorization, hUserAgent)
 
 -- * Composing
 
@@ -132,9 +132,8 @@ withUserAgent agent = withDefaultHeaders [(hUserAgent, agent)]
 {- | Resolve every request against this base: its scheme, host and port
 replace the request's, and its path becomes a prefix.
 
-The 'Url' DSL already composes — @'Effectful.Http.https' "api.example.com"
-'Effectful.Http./:' "v1"@ is a perfectly good base to build call sites
-from — so reach for this to redirect code you do not control, at a staging
+The 'Url' DSL already composes — @"api.example.com" 'Effectful.Http.</>'
+"v1"@ is a perfectly good base to build call sites from — so reach for this to redirect code you do not control, at a staging
 host or a test double.
 -}
 withBaseUrl :: (Http :> es) => Url -> Eff es a -> Eff es a
@@ -144,9 +143,9 @@ withBaseUrl base = shaping $ \req -> req{url = base <> req.url}
 withPathPrefix :: (Http :> es) => [PathSegment] -> Eff es a -> Eff es a
 withPathPrefix prefix = shaping $ \req -> req{url = req.url{path = prefix <> req.url.path}}
 
--- | Add these query parameters to every request, keeping whatever it had.
-withQuery :: (Http :> es) => Query -> Eff es a -> Eff es a
-withQuery extra = shaping $ \req -> req{url = req.url{query = extra <> req.url.query}}
+-- | Add these query parameters to every request, after whatever it had.
+withQueryParams :: (Http :> es) => [Param] -> Eff es a -> Eff es a
+withQueryParams extra = shaping $ \req -> req{url = foldl (<?>) req.url extra}
 
 -- * Transport
 

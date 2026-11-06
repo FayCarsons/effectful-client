@@ -12,10 +12,9 @@ description:
   are not failures at all, so a retry policy is a pattern match instead of a
   tower of @catch@. Requests are built variadically:
   .
-  > get (https "api.example.com" /: "v1" /: "users")
+  > get ("api.example.com" </> "users" </> userId <?> "lightMode" := True)
   >   (header "Accept" "application/json")
-  >   (param "page" "2")
-  >   :: Eff es (Outcome [User])
+  >   :: Eff es (Response (Json User))
   .
   See "Effectful.Http" to get started, "Effectful.Http.Retry" for the retry
   algebra, and "Effectful.Http.Middleware" for request shaping.
@@ -115,11 +114,13 @@ library
     , effectful           >=2.6.1  && <2.7
     , effectful-core      >=2.6.1  && <2.7
     , flatparse           >=0.5.3  && <0.6
+    , http-api-data       >=0.7    && <0.8
     , http-client         >=0.7.19 && <0.8
     , http-types          >=0.12.5 && <0.13
-    , random              >=1.3.1  && <1.4
+    , random             >=1.3.1  && <1.4
     , text                >=2.1.3  && <2.2
     , time                >=1.14   && <1.17
+    , uuid-types          >=1.0.6  && <1.1
 
   if flag(tls)
     exposed-modules: Effectful.Http.TLS
@@ -147,6 +148,7 @@ test-suite effectful-client-test
     , hedgehog            >=1.7     && <1.8
     , hspec               >=2.11.17 && <2.12
     , hspec-hedgehog      >=0.3     && <0.4
+    , http-api-data
     , http-client
     , http-types
     , network             >=3.2     && <3.3

@@ -6,6 +6,7 @@ import Data.Aeson                (decode, encode)
 import Data.ByteString.Lazy      qualified as Lazy
 import Data.Either               (isLeft)
 import Data.Foldable             (for_)
+import Data.Function             ((&))
 import Data.List.NonEmpty        (NonEmpty (..))
 import Data.Maybe                (fromMaybe, listToMaybe)
 import Data.Text                 (Text)
@@ -19,27 +20,63 @@ import Network.HTTP.Types        (methodGet, methodPost)
 import Prelude                   hiding (head)
 import Scripted                  (rawResponse, responded, runScripted)
 import Test.Hspec
+import Web.HttpApiData           (ToHttpApiData)
+
+newtype AccountId = AccountId Int
+  deriving newtype (ToHttpApiData)
+  deriving anyclass (UrlPiece)
+
+page, userId :: Int
+page = 2
+userId = 42
 
 spec :: Spec
 spec = do
   describe "Url" $ do
+    it "reads a string literal as a host over HTTPS" $
+      ("example.com" :: Url) `shouldBe` https "example.com"
+
     it "renders scheme, host and path" $
-      render (https "example.com" /: "v1" /: "users") `shouldBe` "https://example.com/v1/users"
+      render ("example.com" </> "v1" </> "users") `shouldBe` "https://example.com/v1/users"
 
     it "percent-encodes path segments" $
-      render (https "example.com" /: "a b") `shouldBe` "https://example.com/a%20b"
+      render ("example.com" </> "a b") `shouldBe` "https://example.com/a%20b"
+
+    it "keeps a slash inside the segment it belongs to" $ do
+      let name = "a/b" :: Text
+      render ("example.com" </> "users" </> name) `shouldBe` "https://example.com/users/a%2Fb"
 
     it "renders an explicit port" $
-      render (withPort 8080 $ http "localhost" /: "health")
+      render (withPort 8080 (http "localhost") </> "health")
         `shouldBe` "http://localhost:8080/health"
 
     it "keeps the left authority when concatenated" $
-      render ((https "api.example.com" /: "v1") <> (http "ignored" /: "users"))
+      render (("api.example.com" </> "v1") <> (http "ignored" </> "users"))
         `shouldBe` "https://api.example.com/v1/users"
 
-    it "renders its query string" $
-      render (https "example.com" /: "users" /? [("page", Just "2")])
-        `shouldBe` "https://example.com/users?page=2"
+    it "renders its query string, encoding each value" $
+      render ("example.com" </> "search" <?> "q" := "a&b=c" <?> "page" := page)
+        `shouldBe` "https://example.com/search?q=a%26b%3Dc&page=2"
+
+    it "renders segments and values through UrlPiece" $
+      render ("example.com" </> "users" </> userId <?> "lightMode" := True)
+        `shouldBe` "https://example.com/users/42?lightMode=true"
+
+    it "gives a type its UrlPiece from ToHttpApiData" $
+      render ("example.com" </> "accounts" </> AccountId 7) `shouldBe` "https://example.com/accounts/7"
+
+    {- Inside a function given UrlPiece a, GHC will not pick the instance that
+    makes a bare literal Text over that constraint, so the literal is
+    annotated. The given still decides the piece itself. -}
+    it "serves a polymorphic caller through the constraint it was given" $ do
+      let under :: (UrlPiece a) => a -> Url
+          under piece = "example.com" </> ("users" :: Text) </> piece
+      render (under userId) `shouldBe` "https://example.com/users/42"
+      render (under (AccountId 7)) `shouldBe` "https://example.com/users/7"
+
+    it "offers segment and withQuery in place of the operators" $
+      ("example.com" & segment "users" & segment userId & withQuery ("page" := page))
+        `shouldBe` ("example.com" </> "users" </> userId <?> "page" := page)
 
   describe "validHost" $ do
     it "accepts registered names and IPv6 literals" $
@@ -70,14 +107,20 @@ spec = do
     it "reads every part of an authority" $
       parseUrl "http://localhost:8080/v1/users?page=2"
         `shouldBe` Right
-          (withPort 8080 (http "localhost") /: Encoded "v1" /: Encoded "users" /? [("page", Just "2")])
+          Url
+            { scheme = Http
+            , host = "localhost"
+            , port = Just (Port 8080)
+            , path = [Encoded "v1", Encoded "users"]
+            , query = [("page", Just "2")]
+            }
 
     it "reads a dotted name, a hyphenated one and an IPv6 literal" $
       for_ ["api.example.com", "my-service.internal", "[fe80::1]"] \host ->
         fmap (.host) (parseUrl $ "https://" <> host) `shouldBe` Right (Host host)
 
     it "leaves an escape as it found it, rather than encoding it again" $
-      parseUrl "https://example.com/a%20b" `shouldBe` Right (https "example.com" /: Encoded "a%20b")
+      parseUrl "https://example.com/a%20b" `shouldBe` Right ((https "example.com"){path = [Encoded "a%20b"]})
 
     it "round-trips whatever render writes" $
       for_
@@ -123,23 +166,26 @@ spec = do
 
     it "decodes from JSON and encodes back" $ do
       decode "\"https://example.com/v1?a=1\""
-        `shouldBe` Just (https "example.com" /: Encoded "v1" /? [("a", Just "1")])
-      encode (https "example.com" /: "v1") `shouldBe` "\"https://example.com/v1\""
+        `shouldBe` Just ((https "example.com"){path = [Encoded "v1"], query = [("a", Just "1")]})
+      encode ("example.com" </> "v1") `shouldBe` "\"https://example.com/v1\""
 
   describe "a request that cannot name its destination" $
     it "fails as a value, before any connection is attempted" $ do
       manager <- newManager defaultManagerSettings
-      outcome <-
-        runEff . runErrorNoCallStack @Error . runHttp manager . fetch @Lazy.ByteString $
-          request methodGet (https "evil.com@attacker.com" /: "users")
-      outcome `shouldSatisfy` \case
-        Left (InvalidUrl _) -> True
-        _                   -> False
+      {- The second is a path written into a host literal, which a 'Url'
+      literal cannot hold. -}
+      for_ ["evil.com@attacker.com" </> "users", "example.com/v1" </> "users"] \url -> do
+        outcome <-
+          runEff . runErrorNoCallStack @Error . runHttp manager . fetch @Lazy.ByteString $
+            request methodGet url
+        outcome `shouldSatisfy` \case
+          Left (InvalidUrl _) -> True
+          _                   -> False
 
   describe "the variadic builder" $ do
     it "collects headers and query parameters onto a request" $ do
       let built :: Request
-          built = get (https "example.com") (header "Accept" "application/json") (param "page" "2")
+          built = get "example.com" (header "Accept" "application/json") ("page" := page)
       built.method `shouldBe` methodGet
       built.headers `shouldBe` [("Accept", "application/json")]
       built.url.query `shouldBe` [("page", Just "2")]
@@ -148,13 +194,13 @@ spec = do
       let built :: Request
           built =
             get
-              (https "example.com" /: "u")
+              ("example.com" </> "u")
               (header "A" "1")
               (header "B" "2")
-              (param "p" "1")
-              (param "q" "2")
+              ("p" := "1")
+              ["q" := "2", "r" := "3"]
       built.headers `shouldBe` [("A", "1"), ("B", "2")]
-      built.url.query `shouldBe` [("p", Just "1"), ("q", Just "2")]
+      built.url.query `shouldBe` [("p", Just "1"), ("q", Just "2"), ("r", Just "3")]
 
     it "gives each verb its method" $ do
       (post url' :: Request).method `shouldBe` methodPost
@@ -221,7 +267,7 @@ spec = do
       req.headers `shouldBe` [("Accept", "application/json")]
 
     it "redirects every request at a base URL" $ do
-      req <- sent (Middleware (withBaseUrl (http "localhost" /: "stub")))
+      req <- sent (Middleware (withBaseUrl (http "localhost" </> "stub")))
       render req.url `shouldBe` "http://localhost/stub/users"
 
     it "adds a bearer token" $ do
@@ -252,4 +298,4 @@ sent stack = do
     Left err            -> error $ "unexpected Error: " <> show err
  where
   asking :: Eff '[Http, Eff.Error Error, IOE] (Response Lazy.ByteString)
-  asking = get (url' /: "users") (header "Accept" "application/json")
+  asking = get (url' </> "users") (header "Accept" "application/json")

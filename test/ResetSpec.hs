@@ -28,7 +28,7 @@ spec =
         manager <- newManager defaultManagerSettings
         outcome <-
           runEff . runErrorNoCallStack @Error . runHttp manager . fetch @Lazy.ByteString $
-            request methodGet (withPort port $ http "127.0.0.1" /: "flags")
+            request methodGet (withPort port $ http "127.0.0.1" </> "flags")
         outcome `shouldSatisfy` \case
           Left (Unreachable _) -> True
           _                    -> False

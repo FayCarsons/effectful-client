@@ -23,10 +23,19 @@ data User = User {name :: 'Data.Text.Text'}
   deriving anyclass (FromJSON)
   deriving ResponseBody via (Json User)
 
-'get' ('https' "api.example.com" '/:' "v1" '/:' "users")
+'get' ("api.example.com" '</>' "v1" '</>' "users")
   ('header' "Accept" "application/json")
-  ('param' "page" "2")
+  ("page" ':=' page)
   :: 'Eff' es ('Network.HTTP.Client.Response' ('Json' [User]))
+@
+
+A string literal is a host reached over HTTPS; 'http' and 'withPort'
+override that. '</>' appends a path segment and '<?>' a query parameter,
+and both take anything with a 'UrlPiece' instance. A parameter can also
+be passed to the verb, as @"page" ':=' page@ is above.
+
+@
+'get' ("api.example.com" '</>' "users" '</>' userId '<?>' "lightMode" ':=' True)
 @
 
 Ask for @'Eff' es ('Network.HTTP.Client.Response' 'Data.ByteString.Lazy.ByteString')@ to see the raw
@@ -51,11 +60,15 @@ module Effectful.Http
   , Host (..)
   , Port (..)
   , PathSegment (..)
+  , UrlPiece (..)
+  , Param (..)
   , http
   , https
   , withPort
-  , (/:)
-  , (/?)
+  , (</>)
+  , segment
+  , (<?>)
+  , withQuery
   , render
   , parseUrl
   , validHost
@@ -66,7 +79,6 @@ module Effectful.Http
   , request
   , header
   , contentType
-  , param
     -- * Request bodies
   , RequestBody (..)
   , Replay (..)
@@ -223,9 +235,6 @@ header = (,)
 contentType :: ByteString -> Header
 contentType = header hContentType
 
-param :: ByteString -> ByteString -> Query
-param k v = [(k, Just v)]
-
 -- * Request bodies
 
 data RequestBody
@@ -273,6 +282,8 @@ instance Applies RequestBody where applyArg body r = r{body}
 instance Applies Header where applyArg h r = r{headers = r.headers <> [h]}
 instance Applies [Header] where applyArg hs r = r{headers = r.headers <> hs}
 instance Applies Query where applyArg q r = r{url = r.url{query = r.url.query <> q}}
+instance Applies Param where applyArg p r = r{url = r.url <?> p}
+instance Applies [Param] where applyArg ps r = r{url = foldl (<?>) r.url ps}
 instance Applies Timeout where applyArg timeout r = r{timeout}
 instance Applies Redirects where applyArg redirects r = r{redirects}
 
